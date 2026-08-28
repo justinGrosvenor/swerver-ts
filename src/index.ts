@@ -20,10 +20,12 @@ import { brandValue, unbrand } from "./brand.ts";
 import { resolveBinary } from "./binary.ts";
 import {
   generateConfig,
+  validateConfig,
   type Route,
   type SwerverConfig,
   type Upstream,
   type UpstreamRef,
+  type ValidatedConfig,
 } from "./config.ts";
 import {
   compile,
@@ -46,6 +48,17 @@ type AnyHandler = (req: Request, ctx: { params: Params }) => Response | Promise<
 
 const METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] as const;
 export type Method = (typeof METHODS)[number];
+
+/**
+ * A started server. Returned by `start()`. It deliberately has no route or
+ * upstream methods: adding routes after start is a compile error, not just a
+ * runtime throw. Call `stop()` to shut swerver down and clean up.
+ */
+export interface RunningSwerver {
+  readonly port: number;
+  readonly url: string;
+  stop(): Promise<void>;
+}
 
 export interface SwerverOptions {
   /** Front-facing port swerver listens on. Default 8080. */
@@ -149,7 +162,7 @@ export class Swerver {
     return [...new Set(this.#routes.map((r) => r.prefix))];
   }
 
-  async start(): Promise<void> {
+  async start(): Promise<RunningSwerver> {
     if (this.#started) throw new Error("already started");
     this.#started = true;
     const port = this.#opts.port ?? 8080;
@@ -183,26 +196,34 @@ export class Swerver {
       });
     }
 
-    // 2. Generate and write the swerver config.
-    const config = generateConfig({
-      port,
-      address: this.#opts.address,
-      workers: this.#opts.workers ?? 1,
-      staticRoot: this.#opts.staticRoot,
-      appSocket,
-      appPrefixes: this.#prefixes(),
-      upstreams: this.#upstreams,
-      routes: this.#proxyRoutes,
-      raw: this.#opts.raw,
-    });
-    writeFileSync(configPath, JSON.stringify(config, null, 2));
+    // 2. Generate, validate, and write the swerver config. validateConfig is
+    //    the only minter of ValidatedConfig; #spawn below requires one, so an
+    //    invalid config cannot reach swerver. Validation failure aborts before
+    //    any child is spawned (the app server is torn down first).
+    let validated: ValidatedConfig;
+    try {
+      validated = validateConfig(
+        generateConfig({
+          port,
+          address: this.#opts.address,
+          workers: this.#opts.workers ?? 1,
+          staticRoot: this.#opts.staticRoot,
+          appSocket,
+          appPrefixes: this.#prefixes(),
+          upstreams: this.#upstreams,
+          routes: this.#proxyRoutes,
+          raw: this.#opts.raw,
+        }),
+      );
+    } catch (err) {
+      this.#app?.stop(true);
+      rmSync(this.#tmpDir, { recursive: true, force: true });
+      this.#started = false;
+      throw err;
+    }
 
     // 3. Spawn the swerver binary as the front process.
-    const bin = resolveBinary(this.#opts.binaryPath);
-    this.#child = Bun.spawn([bin, "--config", configPath], {
-      stdout: "inherit",
-      stderr: "inherit",
-    });
+    this.#child = this.#spawn(validated, configPath);
 
     // 4. Never orphan the swerver child if this process dies without stop().
     //    'exit' is synchronous, so kill the child directly; signals re-raise
@@ -225,6 +246,25 @@ export class Swerver {
 
     // 5. Wait for the front port to accept connections.
     await this.#waitForPort(port, this.#opts.readyTimeoutMs ?? 5000);
+
+    // 6. Hand back a running handle with no definition methods.
+    return {
+      port,
+      url: `http://${this.#opts.address ?? "localhost"}:${port}`,
+      stop: () => this.#doStop(),
+    };
+  }
+
+  #spawn(config: ValidatedConfig, configPath: string): {
+    kill(sig?: string | number): void;
+    exited: Promise<number>;
+  } {
+    writeFileSync(configPath, JSON.stringify(config, null, 2));
+    const bin = resolveBinary(this.#opts.binaryPath);
+    return Bun.spawn([bin, "--config", configPath], {
+      stdout: "inherit",
+      stderr: "inherit",
+    });
   }
 
   async #waitForPort(port: number, timeoutMs: number): Promise<void> {
@@ -256,7 +296,7 @@ export class Swerver {
   }
 
   /** Stop swerver and the app server, and clean up the temp socket/config. */
-  async stop(): Promise<void> {
+  async #doStop(): Promise<void> {
     this.#cleanup?.();
     this.#child?.kill();
     this.#app?.stop(true);
@@ -278,7 +318,7 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-export { generateConfig } from "./config.ts";
-export type { SwerverConfig, Upstream, Route, UpstreamRef } from "./config.ts";
+export { generateConfig, validateConfig, ConfigError } from "./config.ts";
+export type { SwerverConfig, Upstream, Route, UpstreamRef, ValidatedConfig } from "./config.ts";
 export type { Brand } from "./brand.ts";
 export type { ParamsOf, ParamNames } from "./router.ts";

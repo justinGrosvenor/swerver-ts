@@ -54,3 +54,30 @@ app.proxy("/models/", "bedrock");
 
 // @ts-expect-error - even the right name as a plain string will not do
 app.proxy("/x/", "typo-upstream");
+
+// ── Phantom started state ───────────────────────────────────────────────────
+// start() returns a RunningSwerver with no definition methods.
+async function lifecycle() {
+  const running = await app.start();
+  const p: number = running.port; // ok
+  void p;
+  await running.stop(); // ok
+
+  // @ts-expect-error - cannot add routes to a running server (compile-time)
+  running.get("/late", () => new Response("no"));
+  // @ts-expect-error - no upstream() on a running server either
+  running.upstream("x", { servers: [] });
+}
+void lifecycle;
+
+// ── Validated config brand ──────────────────────────────────────────────────
+import { validateConfig } from "../src/index.ts";
+import type { ValidatedConfig } from "../src/config.ts";
+
+declare function spawnFromValidated(cfg: ValidatedConfig): void;
+const raw = { server: { port: 8080 } };
+
+// @ts-expect-error - a raw config is not a ValidatedConfig
+spawnFromValidated(raw);
+
+spawnFromValidated(validateConfig(raw)); // ok: validateConfig mints the brand

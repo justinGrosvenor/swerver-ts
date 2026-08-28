@@ -18,10 +18,10 @@ app.post("/echo", async (req) => {
 const api = app.upstream("api", { servers: [{ address: "127.0.0.1", port: 9001 }] });
 app.proxy("/api/", api);
 
-await app.start();
-console.log("swerverts up on http://localhost:8080  (Ctrl-C to stop)");
+const server = await app.start();
+console.log(`swerverts up on ${server.url}  (Ctrl-C to stop)`);
 
 process.on("SIGINT", async () => {
-  await app.stop();
+  await server.stop();
   process.exit(0);
 });

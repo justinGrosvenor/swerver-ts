@@ -4,12 +4,16 @@
 // The full schema lives in the swerver repo (docs/reference/config-schema.md).
 // Anything not modelled here can be passed through verbatim via `raw`.
 
-import type { Brand } from "./brand.ts";
+import { brandValue, type Brand } from "./brand.ts";
 
 // An unforgeable reference to a declared upstream. Only `app.upstream(...)`
 // can mint one (it brands the name), so a route can only target an upstream
 // that was actually declared: a typo becomes a compile error, not a 502.
 export type UpstreamRef = Brand<string, "swerver.upstream">;
+
+// A config that has passed validateConfig(). The spawn path accepts only this
+// branded type, so an unvalidated config cannot reach swerver by construction.
+export type ValidatedConfig = Brand<SwerverConfig, "swerver.validated">;
 
 export interface ServerAddress {
   address: string;
@@ -107,4 +111,64 @@ export function generateConfig(input: GenerateInput): SwerverConfig {
     };
   }
   return config;
+}
+
+/** Raised by validateConfig with every problem found, not just the first. */
+export class ConfigError extends Error {
+  constructor(public readonly problems: string[]) {
+    super(`invalid swerver config:\n  - ${problems.join("\n  - ")}`);
+    this.name = "ConfigError";
+  }
+}
+
+function isUnixServer(s: ServerAddress | UnixServer): s is UnixServer {
+  return "unix" in s;
+}
+
+/**
+ * Check the invariants swerver would reject (or silently 502 on) before we
+ * spawn it, and brand the config as validated. This is the only place a
+ * `ValidatedConfig` is produced, so the spawn path can require one.
+ */
+export function validateConfig(config: SwerverConfig): ValidatedConfig {
+  const problems: string[] = [];
+
+  const port = config.server?.port;
+  if (typeof port !== "number" || !Number.isInteger(port) || port < 1 || port > 65535) {
+    problems.push(`server.port must be an integer in 1..65535 (got ${port})`);
+  }
+
+  const upstreams = config.upstreams ?? [];
+  const names = new Set<string>();
+  for (const up of upstreams) {
+    if (!up.name) {
+      problems.push("an upstream is missing a name");
+      continue;
+    }
+    if (names.has(up.name)) problems.push(`duplicate upstream name '${up.name}'`);
+    names.add(up.name);
+    if (!up.servers || up.servers.length === 0) {
+      problems.push(`upstream '${up.name}' has no servers`);
+    }
+    if (up.tls && (up.servers ?? []).some(isUnixServer)) {
+      problems.push(`upstream '${up.name}': tls is not supported on a unix-socket server`);
+    }
+    if (up.tls_sni && /[\x00-\x1f\x7f\r\n]/.test(up.tls_sni)) {
+      problems.push(`upstream '${up.name}': tls_sni contains control characters`);
+    }
+  }
+
+  for (const route of config.routes ?? []) {
+    if (!route.path_prefix || !route.path_prefix.startsWith("/")) {
+      problems.push(`route path_prefix must start with '/' (got '${route.path_prefix}')`);
+    }
+    if (route.upstream && !names.has(route.upstream)) {
+      problems.push(
+        `route '${route.path_prefix}' references undeclared upstream '${route.upstream}'`,
+      );
+    }
+  }
+
+  if (problems.length > 0) throw new ConfigError(problems);
+  return brandValue(config);
 }

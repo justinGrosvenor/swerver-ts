@@ -162,11 +162,31 @@ Declare a swerver upstream and proxy a path prefix to it. `upstream` returns an
 `UpstreamRef` that `proxy` requires, so upstream references are checked at
 compile time. `def` is an upstream minus its `name` (servers, `tls`, ...).
 
-### `app.start()` / `app.stop()`
+### `app.start()` returns a `RunningSwerver`
 
-`start()` launches the app server, writes the config, spawns swerver, and
-resolves once the front port accepts connections. The swerver child is reaped
+`start()` validates the config, launches the app server, spawns swerver, and
+resolves once the front port accepts connections. It returns a running handle:
+
+```ts
+const server = await app.start();
+server.port; // number
+server.url;  // "http://localhost:8080"
+await server.stop();
+```
+
+The handle has no `route`/`upstream`/`proxy` methods, so adding routes after
+start is a compile error, not just a runtime throw. The swerver child is reaped
 automatically if the process exits without `stop()`.
+
+### Config validation
+
+`start()` runs `validateConfig()` before spawning swerver and throws a
+`ConfigError` (listing every problem) if the config is invalid: a bad port, an
+upstream with no servers, a duplicate upstream name, `tls` on a unix-socket
+server, or a route that references an upstream you never declared. Nothing is
+spawned when validation fails. `validateConfig` is also exported for use in
+tests or CI; it returns a `ValidatedConfig`, the only type the spawn path
+accepts.
 
 ## License
 
