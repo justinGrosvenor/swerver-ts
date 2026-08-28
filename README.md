@@ -1,0 +1,128 @@
+# swerverts
+
+Run the [swerver](https://github.com/justingrosvenor/swerver) gateway with
+TypeScript route handlers.
+
+swerver is a high-performance HTTP/1.1 + HTTP/2 + HTTP/3 server and API gateway
+written in Zig. swerverts lets you keep all of that (TLS, HTTP/2, HTTP/3/QUIC,
+static file serving, reverse proxy, rate limiting, auth, x402 payments, WASM
+filters) as the front process, and write your dynamic routes in TypeScript.
+
+## How it works
+
+swerver runs as the front-facing server. Your TypeScript handlers run in a Bun
+HTTP server on a unix socket, and swerver proxies to it as an ordinary
+upstream. Only the routes you declare in TS pay the crossing; static files,
+proxied routes, and every gateway feature stay on swerver's own paths.
+
+```
+client ──▶ swerver (Bun-free hot paths: TLS, H2, H3, static, proxy)
+              │ matched dynamic route
+              ▼
+           Bun app server on a unix socket ──▶ your handler
+```
+
+## Install
+
+Requires [Bun](https://bun.sh) >= 1.2 and the swerver binary. Point swerverts
+at the binary with `SWERVER_BIN`, or install a `@swerver/<platform>` package,
+or put `swerver` on your `PATH`.
+
+```sh
+bun add swerverts
+```
+
+## Usage
+
+```ts
+import { Swerver } from "swerverts";
+
+const app = new Swerver({
+  port: 8080,
+  staticRoot: "./public", // served by swerver, not TS
+});
+
+app.route("/hello/:name", (_req, { params }) =>
+  Response.json({ hi: params.name }),
+);
+
+app.route("/echo", async (req) => {
+  const body = await req.text();
+  return new Response(body, { headers: { "content-type": "text/plain" } });
+});
+
+await app.start();
+```
+
+Handlers use the standard `Request`/`Response` API, so a whole framework can be
+mounted on a prefix:
+
+```ts
+import { Hono } from "hono";
+const api = new Hono();
+api.get("/users/:id", (c) => c.json({ id: c.req.param("id") }));
+
+app.route("/api/*", (req) => api.fetch(req));
+```
+
+### Route patterns
+
+- `/health` exact
+- `/users/:id` named param, available as `ctx.params.id`
+- `/files/*` trailing wildcard, available as `ctx.params.rest`
+
+Each pattern's static leading prefix is registered with swerver as a proxy
+route; swerver forwards matching requests to the app server, which does the
+fine-grained matching.
+
+### Full gateway config
+
+Anything swerverts does not model is passed straight through with `raw`, using
+swerver's [JSON config schema](https://github.com/justingrosvenor/swerver/blob/main/docs/reference/config-schema.md):
+
+```ts
+const app = new Swerver({
+  port: 8443,
+  raw: {
+    server: { tls: { cert: "./cert.pem", key: "./key.pem" }, http3: true },
+    upstreams: [
+      { name: "bedrock", servers: [{ address: "bedrock-runtime.us-east-1.amazonaws.com", port: 443 }], tls: true },
+    ],
+    routes: [
+      { path_prefix: "/models/", upstream: "bedrock", rate_limit: { rps: 50 } },
+    ],
+  },
+});
+```
+
+`raw` upstreams and routes are concatenated with the generated app upstream and
+routes, so static proxying and dynamic TS handlers coexist.
+
+## API
+
+### `new Swerver(options)`
+
+| option | default | meaning |
+| --- | --- | --- |
+| `port` | `8080` | front-facing listen port |
+| `address` | swerver default | front bind address |
+| `workers` | `1` | swerver worker processes |
+| `staticRoot` | none | directory served as static files |
+| `raw` | none | extra config merged over the generated one |
+| `binaryPath` | resolved | explicit path to the swerver binary |
+| `readyTimeoutMs` | `5000` | how long `start()` waits for the port |
+
+### `app.route(pattern, handler)`
+
+Register a dynamic route. `handler` is `(req: Request, ctx: { params }) =>
+Response | Promise<Response>`.
+
+### `app.start()` / `app.stop()`
+
+`start()` launches the app server, writes the config, spawns swerver, and
+resolves once the front port accepts connections. The swerver child is reaped
+automatically if the process exits without `stop()`.
+
+## License
+
+MIT
