@@ -14,7 +14,7 @@
 //   await app.start();
 
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { availableParallelism, tmpdir } from "node:os";
 import { join } from "node:path";
 import { brandValue, unbrand } from "./brand.ts";
 import { resolveBinary } from "./binary.ts";
@@ -189,7 +189,13 @@ export interface SwerverOptions {
   port?: number;
   /** Bind address for the front listener. Default swerver's own default. */
   address?: string;
-  /** swerver worker processes. Default 1 (predictable for a single app socket). */
+  /**
+   * Worker processes. Default 1. Socket backend: passed to swerver's native
+   * fork. FFI backend: a value > 1 re-execs this script as N supervised workers
+   * that share the port via SO_REUSEPORT (0 means one per CPU). Kernel load
+   * balancing across FFI workers is Linux-only; on macOS they bind but the
+   * kernel does not distribute.
+   */
   workers?: number;
   /** Serve a directory of static files (swerver handles this, not TS). */
   staticRoot?: string;
@@ -262,7 +268,10 @@ declare const Bun: {
   serve(opts: { unix: string; fetch: (req: Request) => Response | Promise<Response> }): {
     stop(closeActive?: boolean): void;
   };
-  spawn(cmd: string[], opts?: { stdout?: "inherit"; stderr?: "inherit" }): {
+  spawn(
+    cmd: string[],
+    opts?: { stdout?: "inherit"; stderr?: "inherit"; env?: Record<string, string | undefined> },
+  ): {
     kill(sig?: string | number): void;
     exited: Promise<number>;
   };
@@ -756,7 +765,19 @@ export class Swerver<R extends RouteTable = {}> {
     const validateResponses = this.#opts.validateResponses ?? false;
 
     if (this.#opts.backend === "ffi") {
-      return this.#startFfi(port, ordered, validateResponses);
+      // Fork-per-core: when more than one worker is requested and this process
+      // is not itself a spawned worker, become the supervisor and re-exec this
+      // script as N workers, each a single embedded server sharing the port via
+      // SO_REUSEPORT (which libswerver's listener always sets). Kernel load
+      // balancing across them is Linux-only; on macOS the workers bind but the
+      // kernel does not distribute.
+      const workers = ffiWorkerCount(this.#opts.workers);
+      if (workers > 1 && process.env["SWERVER_FFI_WORKER"] === undefined) {
+        return this.#startForkMaster(port, workers);
+      }
+      const running = await this.#startFfi(port, ordered, validateResponses);
+      this.#watchParent();
+      return running;
     }
 
     this.#tmpDir = mkdtempSync(join(tmpdir(), "swerverts-"));
@@ -861,6 +882,90 @@ export class Swerver<R extends RouteTable = {}> {
       stdout: "inherit",
       stderr: "inherit",
     });
+  }
+
+  // ── FFI fork-per-core supervisor ────────────────────────────────────────
+  // Spawn N copies of this script, each starting one embedded server on the
+  // shared port. This process serves nothing; it only supervises. Children are
+  // marked with SWERVER_FFI_WORKER so their own start() takes the single-server
+  // branch instead of re-forking, and carry SWERVER_MASTER_PID so they exit if
+  // the supervisor dies without cleaning up (e.g. SIGKILL).
+  async #startForkMaster(port: number, workers: number): Promise<RunningSwerver> {
+    const children: Array<{ kill(sig?: string | number): void; exited: Promise<number> }> = [];
+    for (let i = 0; i < workers; i++) {
+      children.push(
+        Bun.spawn([process.execPath, ...process.argv.slice(1)], {
+          stdout: "inherit",
+          stderr: "inherit",
+          env: { ...process.env, SWERVER_FFI_WORKER: String(i), SWERVER_MASTER_PID: String(process.pid) },
+        }),
+      );
+    }
+
+    const killAll = () => {
+      for (const c of children) {
+        try {
+          c.kill();
+        } catch {
+          // already exited
+        }
+      }
+    };
+    // 'exit' covers normal termination; SIGINT/SIGTERM would otherwise kill the
+    // supervisor without reaping the workers, orphaning them on the shared port.
+    const onExit = () => killAll();
+    const onSignal = () => {
+      killAll();
+      process.exit(0);
+    };
+    process.on("exit", onExit);
+    process.on("SIGINT", onSignal);
+    process.on("SIGTERM", onSignal);
+    this.#cleanup = () => {
+      process.removeListener("exit", onExit);
+      process.removeListener("SIGINT", onSignal);
+      process.removeListener("SIGTERM", onSignal);
+    };
+
+    try {
+      await this.#waitForPort(port, this.#opts.readyTimeoutMs ?? 5000);
+    } catch (err) {
+      this.#cleanup();
+      killAll();
+      this.#started = false;
+      throw err;
+    }
+
+    return {
+      port,
+      url: `http://${this.#opts.address ?? "localhost"}:${port}`,
+      stop: async () => {
+        this.#cleanup?.();
+        killAll();
+        await Promise.allSettled(children.map((c) => c.exited));
+        this.#started = false;
+        this.#closed = true;
+      },
+    };
+  }
+
+  // A spawned worker exits if its supervisor disappears without cleanup (a bare
+  // SIGKILL skips the supervisor's reaper), so it never lingers holding the
+  // shared port. No-op unless spawned by #startForkMaster.
+  #watchParent(): void {
+    const raw = process.env["SWERVER_MASTER_PID"];
+    if (raw === undefined) return;
+    const masterPid = Number(raw);
+    if (!Number.isInteger(masterPid) || masterPid <= 0) return;
+    const timer = setInterval(() => {
+      try {
+        process.kill(masterPid, 0); // liveness probe; sends no signal
+      } catch {
+        clearInterval(timer);
+        process.exit(0); // supervisor gone; the FFI onExit handler stops the server
+      }
+    }, 1000);
+    (timer as unknown as { unref?: () => void }).unref?.();
   }
 
   // ── FFI backend ─────────────────────────────────────────────────────────
@@ -1297,6 +1402,14 @@ function joinRoutePath(base: string, path: string): string {
   const left = base.endsWith("/") ? base.slice(0, -1) : base;
   const right = path.startsWith("/") ? path : `/${path}`;
   return `${left}${right}` || "/";
+}
+
+/** Resolve the FFI worker count: 1 by default (single embedded server), the CPU
+ *  count for 0 (auto), else the requested number. */
+function ffiWorkerCount(workers: number | undefined): number {
+  if (workers === undefined || workers === 1) return 1;
+  if (workers <= 0) return Math.max(1, availableParallelism());
+  return Math.floor(workers);
 }
 
 function mergeResponseInit(
