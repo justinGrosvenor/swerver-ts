@@ -891,6 +891,17 @@ export class Swerver<R extends RouteTable = {}> {
   // branch instead of re-forking, and carry SWERVER_MASTER_PID so they exit if
   // the supervisor dies without cleaning up (e.g. SIGKILL).
   async #startForkMaster(port: number, workers: number): Promise<RunningSwerver> {
+    // macOS/Darwin allows every worker to bind the port but does not
+    // load-balance new TCP connections across a SO_REUSEPORT group (no
+    // SO_REUSEPORT_LB, no connection hashing), so one worker serves nearly all
+    // traffic and the rest idle. Fork-per-core distribution needs Linux.
+    if (process.platform === "darwin") {
+      console.warn(
+        `swerverts: ${workers} FFI workers requested, but macOS does not distribute ` +
+          `connections across a SO_REUSEPORT group - one worker will serve nearly all ` +
+          `traffic. Run on Linux for real multi-core scaling.`,
+      );
+    }
     const children: Array<{ kill(sig?: string | number): void; exited: Promise<number> }> = [];
     for (let i = 0; i < workers; i++) {
       children.push(
