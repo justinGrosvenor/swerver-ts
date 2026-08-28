@@ -19,13 +19,16 @@ export interface Lib {
   route(handle: number, patternPtr: number, patternLen: bigint, routeId: number): number;
   poll(): bigint;
   request(reqId: bigint, outPtr: number): number;
+  // Lengths are passed as plain numbers: bun:ffi accepts a JS number for a u64
+  // *argument* (only 64-bit returns must be bigint), which avoids boxing a
+  // BigInt per response. reqId stays bigint (it came from a u64 return).
   respond(
     reqId: bigint,
     status: number,
     ctypePtr: number,
-    ctypeLen: bigint,
+    ctypeLen: number,
     bodyPtr: number,
-    bodyLen: bigint,
+    bodyLen: number,
   ): number;
   start(handle: number): number;
   stop(handle: number): void;
