@@ -80,7 +80,14 @@ function makeVerb(baseUrl: string, method: string, fetchImpl: FetchLike) {
     if (args.query) {
       const qs = new URLSearchParams();
       for (const [key, value] of Object.entries(args.query)) {
-        if (value !== undefined) qs.set(key, String(value));
+        if (value === undefined) continue;
+        // Emit repeated keys for arrays (tag=a&tag=b) to match the server's
+        // array-aware query parsing; String(array) would comma-join instead.
+        if (Array.isArray(value)) {
+          for (const item of value) if (item !== undefined) qs.append(key, String(item));
+        } else {
+          qs.set(key, String(value));
+        }
       }
       const s = qs.toString();
       if (s) url += `?${s}`;

@@ -616,6 +616,12 @@ export class Swerver<R extends RouteTable = {}> {
         // semantics (an init content-type still wins), while letting the FFI
         // direct-write path reuse RESPONSE_JSON instead of re-stringifying.
         const json = JSON.stringify(data);
+        if (json === undefined) {
+          // undefined, a function, or a symbol: not JSON-serializable.
+          // Response.json throws a TypeError here, so match it rather than
+          // sending an empty body (and tagging RESPONSE_JSON as undefined).
+          throw new TypeError("ctx.json: value is not JSON-serializable");
+        }
         const res = new Response(json, mergeResponseInit(init, "application/json"));
         Reflect.set(res, RESPONSE_DATA, data);
         Reflect.set(res, RESPONSE_JSON, json);
@@ -1030,11 +1036,15 @@ export class Swerver<R extends RouteTable = {}> {
     // endian: each u64 is [low32, high32]; pointers fit in a JS number (48-bit
     // virtual addresses), lengths are u32.
     if (lib.request(reqId, slabPtr) !== 0) return;
-    if (lib.requestHeaders(reqId, slabPtr + 64) !== 0) return;
     const method = readSlice(slab[0]! + slab[1]! * 4294967296, slab[2]!);
     const rawPath = readSlice(slab[4]! + slab[5]! * 4294967296, slab[6]!);
-    const headersPtr = slab[16]! + slab[17]! * 4294967296;
-    const headersLen = slab[18]!;
+    // requestHeaders shares the slot request() just resolved, so it fails only
+    // if the slot went stale. Fall back to no headers rather than returning
+    // without answering, which would strand the slot until shutdown. Read the
+    // header lanes only when it succeeded (they are otherwise stale slab data).
+    const hasHeaders = lib.requestHeaders(reqId, slabPtr + 64) === 0;
+    const headersPtr = hasHeaders ? slab[16]! + slab[17]! * 4294967296 : 0;
+    const headersLen = hasHeaders ? slab[18]! : 0;
     const bodyLen = slab[10]!;
     // `body` is a view over the slot's native req_body (no copy). Safe only
     // because the Request constructor below extracts the BufferSource
