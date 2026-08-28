@@ -16,12 +16,36 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { brandValue, unbrand } from "./brand.ts";
 import { resolveBinary } from "./binary.ts";
-import { generateConfig, type SwerverConfig } from "./config.ts";
-import { compile, match, sortBySpecificity, type CompiledRoute, type Params } from "./router.ts";
+import {
+  generateConfig,
+  type Route,
+  type SwerverConfig,
+  type Upstream,
+  type UpstreamRef,
+} from "./config.ts";
+import {
+  compile,
+  match,
+  sortBySpecificity,
+  type CompiledRoute,
+  type Params,
+  type ParamsOf,
+} from "./router.ts";
 
-export type Ctx = { params: Params };
-export type Handler = (req: Request, ctx: Ctx) => Response | Promise<Response>;
+/** Handler context. `params` keys are inferred from the route pattern. */
+export type Ctx<P extends string = string> = { params: ParamsOf<P> };
+export type Handler<P extends string = string> = (
+  req: Request,
+  ctx: Ctx<P>,
+) => Response | Promise<Response>;
+
+// Internal, param-erased handler shape for storage and dispatch.
+type AnyHandler = (req: Request, ctx: { params: Params }) => Response | Promise<Response>;
+
+const METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] as const;
+export type Method = (typeof METHODS)[number];
 
 export interface SwerverOptions {
   /** Front-facing port swerver listens on. Default 8080. */
@@ -56,7 +80,9 @@ declare const Bun: {
 
 export class Swerver {
   #opts: SwerverOptions;
-  #routes: CompiledRoute<Handler>[] = [];
+  #routes: CompiledRoute<AnyHandler>[] = [];
+  #upstreams: Upstream[] = [];
+  #proxyRoutes: Route[] = [];
   #app?: { stop(closeActive?: boolean): void };
   #child?: { kill(sig?: string | number): void; exited: Promise<number> };
   #tmpDir?: string;
@@ -67,10 +93,54 @@ export class Swerver {
     this.#opts = opts;
   }
 
-  /** Register a dynamic route. Patterns support ":param" and a trailing "*". */
-  route(pattern: string, handler: Handler): this {
+  /**
+   * Register a dynamic route for any method. Patterns support ":param" and a
+   * trailing "*"; the handler's `ctx.params` keys are inferred from the pattern.
+   */
+  route<P extends string>(pattern: P, handler: Handler<P>): this {
+    return this.#add(pattern, handler as AnyHandler, undefined);
+  }
+
+  get<P extends string>(pattern: P, handler: Handler<P>): this {
+    return this.#add(pattern, handler as AnyHandler, "GET");
+  }
+  post<P extends string>(pattern: P, handler: Handler<P>): this {
+    return this.#add(pattern, handler as AnyHandler, "POST");
+  }
+  put<P extends string>(pattern: P, handler: Handler<P>): this {
+    return this.#add(pattern, handler as AnyHandler, "PUT");
+  }
+  patch<P extends string>(pattern: P, handler: Handler<P>): this {
+    return this.#add(pattern, handler as AnyHandler, "PATCH");
+  }
+  delete<P extends string>(pattern: P, handler: Handler<P>): this {
+    return this.#add(pattern, handler as AnyHandler, "DELETE");
+  }
+
+  #add(pattern: string, handler: AnyHandler, method?: string): this {
     if (this.#started) throw new Error("cannot add routes after start()");
-    this.#routes.push(compile(pattern, handler));
+    this.#routes.push(compile(pattern, handler, method));
+    return this;
+  }
+
+  /**
+   * Declare a swerver upstream and get back an unforgeable reference to it.
+   * Pass that reference to `proxy()`; a route cannot target an upstream that
+   * was never declared.
+   */
+  upstream(name: string, def: Omit<Upstream, "name">): UpstreamRef {
+    if (this.#started) throw new Error("cannot add upstreams after start()");
+    this.#upstreams.push({ name, ...def });
+    return brandValue(name);
+  }
+
+  /**
+   * Proxy a path prefix to a declared upstream (swerver handles it directly,
+   * no TS crossing). `target` must be a reference from `upstream()`.
+   */
+  proxy(prefix: string, target: UpstreamRef, opts?: Omit<Route, "path_prefix" | "upstream">): this {
+    if (this.#started) throw new Error("cannot add routes after start()");
+    this.#proxyRoutes.push({ path_prefix: prefix, upstream: unbrand(target), ...opts });
     return this;
   }
 
@@ -95,8 +165,14 @@ export class Swerver {
         unix: appSocket,
         fetch: async (req: Request) => {
           const path = new URL(req.url).pathname;
-          const hit = match(ordered, path);
-          if (!hit) return new Response("not found", { status: 404 });
+          const hit = match(ordered, path, req.method);
+          if (hit.kind === "none") return new Response("not found", { status: 404 });
+          if (hit.kind === "method") {
+            return new Response("method not allowed", {
+              status: 405,
+              headers: { allow: hit.allowed.join(", ") },
+            });
+          }
           try {
             return await hit.route.handler(req, { params: hit.params });
           } catch (err) {
@@ -115,6 +191,8 @@ export class Swerver {
       staticRoot: this.#opts.staticRoot,
       appSocket,
       appPrefixes: this.#prefixes(),
+      upstreams: this.#upstreams,
+      routes: this.#proxyRoutes,
       raw: this.#opts.raw,
     });
     writeFileSync(configPath, JSON.stringify(config, null, 2));
@@ -201,4 +279,6 @@ function sleep(ms: number): Promise<void> {
 }
 
 export { generateConfig } from "./config.ts";
-export type { SwerverConfig, Upstream, Route } from "./config.ts";
+export type { SwerverConfig, Upstream, Route, UpstreamRef } from "./config.ts";
+export type { Brand } from "./brand.ts";
+export type { ParamsOf, ParamNames } from "./router.ts";

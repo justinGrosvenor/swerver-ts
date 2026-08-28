@@ -42,16 +42,54 @@ const app = new Swerver({
   staticRoot: "./public", // served by swerver, not TS
 });
 
-app.route("/hello/:name", (_req, { params }) =>
+// params is typed from the pattern: { name: string } here.
+app.get("/hello/:name", (_req, { params }) =>
   Response.json({ hi: params.name }),
 );
 
-app.route("/echo", async (req) => {
+app.post("/echo", async (req) => {
   const body = await req.text();
   return new Response(body, { headers: { "content-type": "text/plain" } });
 });
 
 await app.start();
+```
+
+### Typed route params
+
+Param names are read out of the pattern literal at compile time, so
+`ctx.params` has exactly the keys the route declares. A wrong key is a type
+error, not a runtime `undefined`:
+
+```ts
+app.get("/users/:id/posts/:postId", (_req, { params }) => {
+  params.id;      // string
+  params.postId;  // string
+  params.nope;    // compile error
+  return new Response("ok");
+});
+
+app.get("/files/*", (_req, { params }) => new Response(params.rest));
+```
+
+`route()` matches any method; `get`/`post`/`put`/`patch`/`delete` constrain it,
+and a path that matches with the wrong method returns `405` with an `Allow`
+header.
+
+### Typed upstreams
+
+`upstream()` returns an unforgeable reference. `proxy()` accepts only that
+reference, so a route can never point at an upstream you did not declare (a
+typo is a compile error instead of a runtime 502):
+
+```ts
+const bedrock = app.upstream("bedrock", {
+  servers: [{ address: "bedrock-runtime.us-east-1.amazonaws.com", port: 443 }],
+  tls: true,
+});
+
+app.proxy("/models/", bedrock);   // ok
+app.proxy("/models/", "bedrock"); // compile error: not an UpstreamRef
 ```
 
 Handlers use the standard `Request`/`Response` API, so a whole framework can be
@@ -112,10 +150,17 @@ routes, so static proxying and dynamic TS handlers coexist.
 | `binaryPath` | resolved | explicit path to the swerver binary |
 | `readyTimeoutMs` | `5000` | how long `start()` waits for the port |
 
-### `app.route(pattern, handler)`
+### `app.route(pattern, handler)` and `app.get/post/put/patch/delete`
 
 Register a dynamic route. `handler` is `(req: Request, ctx: { params }) =>
-Response | Promise<Response>`.
+Response | Promise<Response>`, and `ctx.params` is typed from the pattern.
+`route` matches any method; the verb methods constrain it.
+
+### `app.upstream(name, def)` / `app.proxy(prefix, ref, opts?)`
+
+Declare a swerver upstream and proxy a path prefix to it. `upstream` returns an
+`UpstreamRef` that `proxy` requires, so upstream references are checked at
+compile time. `def` is an upstream minus its `name` (servers, `tls`, ...).
 
 ### `app.start()` / `app.stop()`
 

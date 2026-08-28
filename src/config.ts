@@ -4,6 +4,13 @@
 // The full schema lives in the swerver repo (docs/reference/config-schema.md).
 // Anything not modelled here can be passed through verbatim via `raw`.
 
+import type { Brand } from "./brand.ts";
+
+// An unforgeable reference to a declared upstream. Only `app.upstream(...)`
+// can mint one (it brands the name), so a route can only target an upstream
+// that was actually declared: a typo becomes a compile error, not a 502.
+export type UpstreamRef = Brand<string, "swerver.upstream">;
+
 export interface ServerAddress {
   address: string;
   port: number;
@@ -55,8 +62,12 @@ export interface GenerateInput {
   appSocket: string;
   // Distinct swerver path prefixes derived from the app's dynamic routes.
   appPrefixes: string[];
-  // Merged over the generated config; wins on conflicts. Use for upstreams,
-  // routes, tls, rate limits, and anything else swerverts does not model.
+  // Upstreams and routes declared through the typed builder (app.upstream /
+  // app.proxy). Concatenated with the generated app upstream and the raw ones.
+  upstreams?: Upstream[];
+  routes?: Route[];
+  // Merged over the generated config; wins on conflicts. Use for tls, and
+  // anything else swerverts does not model.
   raw?: Partial<SwerverConfig>;
 }
 
@@ -81,6 +92,9 @@ export function generateConfig(input: GenerateInput): SwerverConfig {
       config.routes!.push({ path_prefix: prefix, upstream: APP_UPSTREAM });
     }
   }
+
+  if (input.upstreams) config.upstreams!.push(...input.upstreams);
+  if (input.routes) config.routes!.push(...input.routes);
 
   if (input.raw) {
     const raw = input.raw;
