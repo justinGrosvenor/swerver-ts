@@ -131,3 +131,17 @@ void clientUse;
 
 // ── OpenAPI document ────────────────────────────────────────────────────────
 export type OpenApiChecks = [Expect<Equal<ReturnType<typeof api.openapi>, Record<string, unknown>>>];
+
+// ── Mock client (same typing as the network client, in-process) ─────────────
+export type RequestCheck = [Expect<Equal<ReturnType<typeof api.request>, Promise<Response>>>];
+
+const mock = api.mockClient();
+async function mockUse() {
+  const r = await mock.post("/users", { body: { name: "ada", age: 3 } });
+  const u = await r.json();
+  const id: string = u.id; // typed the same as the network client
+  void id;
+  // @ts-expect-error - wrong body shape, checked in-process too
+  await mock.post("/users", { body: { name: 123 } });
+}
+void mockUse;

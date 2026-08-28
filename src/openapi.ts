@@ -78,7 +78,7 @@ export function buildOpenApi(
   const paths: Record<string, Record<string, unknown>> = {};
 
   for (const route of routes) {
-    if (!route.method) continue; // any-method routes have no single verb
+    if (!route.method || route.internal) continue; // skip any-method and docs routes
 
     const oaPath = toOpenApiPath(route.pattern);
     const item = paths[oaPath] ?? (paths[oaPath] = {});

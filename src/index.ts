@@ -167,6 +167,14 @@ export interface SwerverOptions {
 // can validate it against the response schema when validateResponses is on.
 const RESPONSE_DATA = Symbol("swerverts.responseData");
 
+/** Options for `app.docs()`: OpenAPI options plus where to mount the pages. */
+export interface DocsOptions extends OpenApiOptions {
+  /** Path for the Swagger UI page. Default "/docs". */
+  path?: string;
+  /** Path for the OpenAPI JSON document. Default "/openapi.json". */
+  openapiPath?: string;
+}
+
 // Bun's global is untyped from plain TS; declare the sliver we use.
 declare const Bun: {
   serve(opts: { unix: string; fetch: (req: Request) => Response | Promise<Response> }): {
@@ -321,6 +329,143 @@ export class Swerver<R extends RouteTable = {}> {
     return buildOpenApi(this.#routes, options);
   }
 
+  /**
+   * Serve interactive API docs. Registers two routes: `openapiPath`
+   * (default `/openapi.json`) returning the OpenAPI document, and `path`
+   * (default `/docs`) returning a Swagger UI page pointed at it. Both are
+   * excluded from the OpenAPI document itself. Pass `toJsonSchema` to fill in
+   * body/param schemas (e.g. Zod v4's `z.toJSONSchema`).
+   */
+  docs(options: DocsOptions = {}): this {
+    const path = options.path ?? "/docs";
+    const openapiPath = options.openapiPath ?? "/openapi.json";
+    const title = options.info?.title ?? "swerverts API";
+    const openapiOptions: OpenApiOptions = {
+      ...(options.info ? { info: options.info } : {}),
+      ...(options.servers ? { servers: options.servers } : {}),
+      toJsonSchema: options.toJsonSchema,
+    };
+    this.#registerInternal(openapiPath, () => Response.json(this.openapi(openapiOptions)));
+    this.#registerInternal(
+      path,
+      () =>
+        new Response(swaggerHtml(title, openapiPath), {
+          headers: { "content-type": "text/html; charset=utf-8" },
+        }),
+    );
+    return this;
+  }
+
+  #registerInternal(pattern: string, handler: (req: Request) => Response): void {
+    if (this.#started) throw new Error("cannot add routes after start()");
+    const route = compile(pattern, ((req: Request) => handler(req)) as AnyHandler, "GET");
+    route.internal = true;
+    this.#routes.push(route);
+  }
+
+  // Shared request pipeline: match -> validate body/query/headers -> handler
+  // -> optional response validation. Used by the live server and the mock.
+  async #dispatch(
+    req: Request,
+    ordered: CompiledRoute<AnyHandler>[],
+    validateResponses: boolean,
+  ): Promise<Response> {
+    const path = new URL(req.url).pathname;
+    const hit = match(ordered, path, req.method);
+    if (hit.kind === "none") return new Response("not found", { status: 404 });
+    if (hit.kind === "method") {
+      return new Response("method not allowed", {
+        status: 405,
+        headers: { allow: hit.allowed.join(", ") },
+      });
+    }
+    const route = hit.route;
+    const ctx: AnyCtx = {
+      params: hit.params,
+      json: (data: unknown) => {
+        const res = Response.json(data);
+        Reflect.set(res, RESPONSE_DATA, data);
+        return res;
+      },
+    };
+    const { body, query, headers } = route.schemas;
+
+    if (body) {
+      let raw: unknown;
+      try {
+        raw = await req.json();
+      } catch {
+        return jsonError(400, "invalid JSON body");
+      }
+      const result = await runValidation(body, raw);
+      if (result.issues) return validationError(result.issues);
+      ctx.body = result.value;
+    }
+
+    if (query) {
+      const q = Object.fromEntries(new URL(req.url).searchParams);
+      const result = await runValidation(query, q);
+      if (result.issues) return validationError(result.issues);
+      ctx.query = result.value;
+    }
+
+    if (headers) {
+      const h = Object.fromEntries(req.headers);
+      const result = await runValidation(headers, h);
+      if (result.issues) return validationError(result.issues);
+      ctx.headers = result.value;
+    }
+
+    let out: Response;
+    try {
+      out = await route.handler(req, ctx);
+    } catch (err) {
+      console.error("swerverts handler error:", err);
+      return new Response("internal error", { status: 500 });
+    }
+
+    const responseSchema = route.schemas.response;
+    if (validateResponses && responseSchema && Reflect.has(out, RESPONSE_DATA)) {
+      const data = Reflect.get(out, RESPONSE_DATA);
+      const result = await runValidation(responseSchema, data);
+      if (result.issues) {
+        console.error("swerverts response contract violation:", formatIssues(result.issues));
+        return jsonError(500, "response did not match its schema");
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Dispatch one request against the registered routes in-process, without
+   * spawning swerver. A relative path is resolved against a dummy origin.
+   * Ideal for unit-testing handlers and validation.
+   */
+  request(input: string | URL | Request, init?: RequestInit): Promise<Response> {
+    const req =
+      input instanceof Request
+        ? input
+        : new Request(
+            typeof input === "string" && input.startsWith("/")
+              ? new URL(input, "http://mock.local")
+              : input,
+            init,
+          );
+    return this.#dispatch(req, sortBySpecificity(this.#routes), this.#opts.validateResponses ?? true);
+  }
+
+  /**
+   * A typed client (same shape as `client()`) that dispatches in-process
+   * against the registered routes. No server, no network: for tests.
+   */
+  mockClient(): Client<R> {
+    const ordered = sortBySpecificity(this.#routes);
+    const validateResponses = this.#opts.validateResponses ?? true;
+    return createClient<R>("http://mock.local", (url, requestInit) =>
+      this.#dispatch(new Request(url, requestInit), ordered, validateResponses),
+    );
+  }
+
   async start(): Promise<RunningSwerver> {
     if (this.#started) throw new Error("already started");
     this.#started = true;
@@ -336,75 +481,7 @@ export class Swerver<R extends RouteTable = {}> {
     if (this.#routes.length > 0) {
       this.#app = Bun.serve({
         unix: appSocket,
-        fetch: async (req: Request) => {
-          const path = new URL(req.url).pathname;
-          const hit = match(ordered, path, req.method);
-          if (hit.kind === "none") return new Response("not found", { status: 404 });
-          if (hit.kind === "method") {
-            return new Response("method not allowed", {
-              status: 405,
-              headers: { allow: hit.allowed.join(", ") },
-            });
-          }
-          const route = hit.route;
-          const ctx: AnyCtx = {
-            params: hit.params,
-            json: (data: unknown) => {
-              const res = Response.json(data);
-              Reflect.set(res, RESPONSE_DATA, data);
-              return res;
-            },
-          };
-          const { body, query, headers } = route.schemas;
-
-          if (body) {
-            let raw: unknown;
-            try {
-              raw = await req.json();
-            } catch {
-              return jsonError(400, "invalid JSON body");
-            }
-            const result = await runValidation(body, raw);
-            if (result.issues) return validationError(result.issues);
-            ctx.body = result.value;
-          }
-
-          if (query) {
-            const q = Object.fromEntries(new URL(req.url).searchParams);
-            const result = await runValidation(query, q);
-            if (result.issues) return validationError(result.issues);
-            ctx.query = result.value;
-          }
-
-          if (headers) {
-            const h = Object.fromEntries(req.headers);
-            const result = await runValidation(headers, h);
-            if (result.issues) return validationError(result.issues);
-            ctx.headers = result.value;
-          }
-
-          let out: Response;
-          try {
-            out = await route.handler(req, ctx);
-          } catch (err) {
-            console.error("swerverts handler error:", err);
-            return new Response("internal error", { status: 500 });
-          }
-
-          const responseSchema = route.schemas.response;
-          if (validateResponses && responseSchema && Reflect.has(out, RESPONSE_DATA)) {
-            const data = Reflect.get(out, RESPONSE_DATA);
-            const result = await runValidation(responseSchema, data);
-            if (result.issues) {
-              console.error(
-                "swerverts response contract violation:",
-                formatIssues(result.issues),
-              );
-              return jsonError(500, "response did not match its schema");
-            }
-          }
-          return out;
-        },
+        fetch: (req: Request) => this.#dispatch(req, ordered, validateResponses),
       });
     }
 
@@ -544,6 +621,29 @@ function validationError(issues: Parameters<typeof formatIssues>[0]): Response {
   );
 }
 
+// Swagger UI page loading the dist assets from a CDN and pointing at the app's
+// own OpenAPI document. Served by the app itself, so no CSP restrictions apply.
+function swaggerHtml(title: string, openapiUrl: string): string {
+  const safeTitle = title.replace(/[<&]/g, (c) => (c === "<" ? "&lt;" : "&amp;"));
+  const url = JSON.stringify(openapiUrl);
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>${safeTitle}</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css" />
+</head>
+<body>
+  <div id="swagger-ui"></div>
+  <script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js" crossorigin></script>
+  <script>
+    window.ui = SwaggerUIBundle({ url: ${url}, dom_id: "#swagger-ui" });
+  </script>
+</body>
+</html>`;
+}
+
 export { generateConfig, validateConfig, ConfigError } from "./config.ts";
 export type { SwerverConfig, Upstream, Route, UpstreamRef, ValidatedConfig } from "./config.ts";
 export type { Brand } from "./brand.ts";
@@ -553,3 +653,4 @@ export { createClient } from "./client.ts";
 export type { Client, ClientResponse } from "./client.ts";
 export { buildOpenApi } from "./openapi.ts";
 export type { OpenApiDocument, OpenApiOptions } from "./openapi.ts";
+export type { FetchLike } from "./client.ts";

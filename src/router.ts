@@ -48,6 +48,9 @@ export interface CompiledRoute<H> {
   // Request-body / query / header / response validators. The dispatcher runs
   // body, query, and headers before the handler.
   schemas: RouteSchemas;
+  // Internal routes (e.g. the docs/openapi endpoints) are excluded from the
+  // generated OpenAPI document.
+  internal?: boolean | undefined;
   // The static leading path, up to the first ":" or "*". This is what swerver
   // matches on as a route path_prefix.
   prefix: string;

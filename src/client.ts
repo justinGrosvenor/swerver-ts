@@ -68,7 +68,11 @@ function fillPath(pattern: string, params: Record<string, string> | undefined): 
   return out;
 }
 
-function makeVerb(baseUrl: string, method: string) {
+/** How the client issues requests. Swappable so a mock client can dispatch
+ * in-process instead of over the network. */
+export type FetchLike = (url: string, init: RequestInit) => Promise<Response>;
+
+function makeVerb(baseUrl: string, method: string, fetchImpl: FetchLike) {
   return async (path: string, args: RuntimeArgs = {}): Promise<Response> => {
     let url = baseUrl + fillPath(path, args.params);
     if (args.query) {
@@ -86,17 +90,20 @@ function makeVerb(baseUrl: string, method: string) {
       headers["content-type"] = "application/json";
     }
     if (Object.keys(headers).length > 0) init.headers = headers;
-    return fetch(url, init);
+    return fetchImpl(url, init);
   };
 }
 
-export function createClient<R extends RouteTable>(baseUrl: string): Client<R> {
+export function createClient<R extends RouteTable>(
+  baseUrl: string,
+  fetchImpl: FetchLike = (url, init) => fetch(url, init),
+): Client<R> {
   const base = baseUrl.replace(/\/$/, "");
   return {
-    get: makeVerb(base, "GET"),
-    post: makeVerb(base, "POST"),
-    put: makeVerb(base, "PUT"),
-    patch: makeVerb(base, "PATCH"),
-    delete: makeVerb(base, "DELETE"),
+    get: makeVerb(base, "GET", fetchImpl),
+    post: makeVerb(base, "POST", fetchImpl),
+    put: makeVerb(base, "PUT", fetchImpl),
+    patch: makeVerb(base, "PATCH", fetchImpl),
+    delete: makeVerb(base, "DELETE", fetchImpl),
   } as unknown as Client<R>;
 }

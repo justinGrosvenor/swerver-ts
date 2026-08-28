@@ -27,6 +27,13 @@ app.post("/users/:id", { body: CreateUser, response: UserOut }, (_req, ctx) =>
 const api = app.upstream("api", { servers: [{ address: "127.0.0.1", port: 9001 }] });
 app.proxy("/api/", api);
 
+// Serve interactive docs at /docs and the spec at /openapi.json. The converter
+// receives a generic Standard Schema, so cast to your library's type.
+app.docs({
+  info: { title: "Hello API", version: "0.1.0" },
+  toJsonSchema: (schema) => z.toJSONSchema(schema as z.ZodType) as Record<string, unknown>,
+});
+
 const server = await app.start();
 console.log(`swerverts up on ${server.url}  (Ctrl-C to stop)`);
 

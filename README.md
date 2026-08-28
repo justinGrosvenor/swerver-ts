@@ -152,11 +152,51 @@ import { z } from "zod";
 const doc = app.openapi({
   info: { title: "Users API", version: "1.0.0" },
   servers: [{ url: "http://localhost:8080" }],
-  toJsonSchema: (schema) => z.toJSONSchema(schema),
+  toJsonSchema: (schema) => z.toJSONSchema(schema as z.ZodType) as Record<string, unknown>,
 });
 // doc.paths["/users/{id}"].get.parameters -> [{ name: "id", in: "path", ... }]
 // doc.paths["/users"].post.responses -> { "200": ..., "400": ..., "422": ... }
 ```
+
+### Interactive docs
+
+`app.docs(options?)` serves live API docs: a Swagger UI page at `path`
+(default `/docs`) and the OpenAPI document at `openapiPath` (default
+`/openapi.json`). Both are excluded from the document itself. It takes the same
+options as `openapi()`.
+
+```ts
+import { z } from "zod";
+
+app.docs({
+  info: { title: "Users API", version: "1.0.0" },
+  toJsonSchema: (schema) => z.toJSONSchema(schema as z.ZodType) as Record<string, unknown>,
+});
+// GET /docs         -> Swagger UI
+// GET /openapi.json -> the spec
+```
+
+### Testing without a server
+
+`app.request(input, init?)` dispatches one request against the registered
+routes in-process, with no swerver spawned and no network. `app.mockClient()`
+returns the same typed client as `client()` but backed by in-process dispatch.
+Both run the full pipeline (matching, body/query/header validation, and
+response validation). Ideal for fast unit tests:
+
+```ts
+const app = build();
+
+const res = await app.request("/users/9");
+expect(res.status).toBe(200);
+
+const mock = app.mockClient();
+const user = await (await mock.post("/users", { body: { name: "ada", age: 3 } })).json();
+// user is typed { id: string; name: string }
+```
+
+Response validation defaults to on in `request`/`mockClient`, so a handler that
+breaks its response contract fails your test with a 500.
 
 ### Response validation in development
 
@@ -267,11 +307,18 @@ Declare a swerver upstream and proxy a path prefix to it. `upstream` returns an
 `UpstreamRef` that `proxy` requires, so upstream references are checked at
 compile time. `def` is an upstream minus its `name` (servers, `tls`, ...).
 
-### `app.client(baseUrl?)` / `app.openapi(options?)`
+### `app.client(baseUrl?)` / `app.openapi(options?)` / `app.docs(options?)`
 
 `client` returns a typed fetch client for the registered routes (chain the
 route calls so the table accumulates). `openapi` returns an OpenAPI 3.1
-document; pass `toJsonSchema` to convert your schemas.
+document; pass `toJsonSchema` to convert your schemas. `docs` serves Swagger UI
+plus the spec.
+
+### `app.request(input, init?)` / `app.mockClient()`
+
+Exercise handlers in-process without spawning swerver. `request` dispatches a
+single request; `mockClient` returns the same typed client as `client()`,
+backed by in-process dispatch. Both for tests.
 
 ### `app.start()` returns a `RunningSwerver`
 
