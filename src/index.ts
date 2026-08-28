@@ -29,6 +29,7 @@ import {
 } from "./config.ts";
 import { createClient, type Client } from "./client.ts";
 import { buildOpenApi, type OpenApiDocument, type OpenApiOptions } from "./openapi.ts";
+import { loadLib, resolveLib, ptr, toArrayBuffer, type Lib } from "./ffi.ts";
 import {
   compile,
   match,
@@ -151,8 +152,17 @@ export interface SwerverOptions {
   staticRoot?: string;
   /** Extra swerver config merged over the generated one (tls, upstreams, routes, ...). */
   raw?: Partial<SwerverConfig>;
+  /**
+   * How dynamic routes are served. "socket" (default) proxies to a Bun app
+   * server over a unix socket. "ffi" embeds swerver in-process via libswerver
+   * and hands requests to JS with no socket hop (faster; single reactor
+   * thread). "ffi" requires Bun and libswerver.
+   */
+  backend?: "socket" | "ffi";
   /** Explicit path to the swerver binary. Else SWERVER_BIN, platform pkg, or PATH. */
   binaryPath?: string;
+  /** Explicit path to libswerver (ffi backend). Else SWERVER_LIB or beside SWERVER_BIN. */
+  libraryPath?: string;
   /** Milliseconds to wait for the front port to accept connections. Default 5000. */
   readyTimeoutMs?: number;
   /**
@@ -199,6 +209,8 @@ export class Swerver<R extends RouteTable = {}> {
   #tmpDir?: string;
   #started = false;
   #cleanup?: () => void;
+  #ffiHandle = 0;
+  #ffiRunning = false;
 
   constructor(opts: SwerverOptions = {}) {
     this.#opts = opts;
@@ -473,6 +485,10 @@ export class Swerver<R extends RouteTable = {}> {
     const ordered = sortBySpecificity(this.#routes);
     const validateResponses = this.#opts.validateResponses ?? false;
 
+    if (this.#opts.backend === "ffi") {
+      return this.#startFfi(port, ordered, validateResponses);
+    }
+
     this.#tmpDir = mkdtempSync(join(tmpdir(), "swerverts-"));
     const appSocket = join(this.#tmpDir, "app.sock");
     const configPath = join(this.#tmpDir, "config.json");
@@ -556,6 +572,130 @@ export class Swerver<R extends RouteTable = {}> {
     });
   }
 
+  // ── FFI backend ─────────────────────────────────────────────────────────
+  async #startFfi(
+    port: number,
+    ordered: CompiledRoute<AnyHandler>[],
+    validateResponses: boolean,
+  ): Promise<RunningSwerver> {
+    const lib = loadLib(resolveLib(this.#opts.libraryPath));
+
+    // Config for the embedded server: no app upstream (dynamic routes are
+    // handled in-process via FFI, not proxied). Static and any raw upstreams/
+    // routes still pass through. workers is forced to 1 by libswerver.
+    const config = validateConfig(
+      generateConfig({
+        port,
+        address: this.#opts.address,
+        staticRoot: this.#opts.staticRoot,
+        appSocket: "",
+        appPrefixes: [],
+        upstreams: this.#upstreams,
+        routes: this.#proxyRoutes,
+        raw: this.#opts.raw,
+      }),
+    );
+    const cfgBytes = new TextEncoder().encode(JSON.stringify(config));
+    const handle = lib.init(ptr(cfgBytes), BigInt(cfgBytes.length));
+    if (handle === 0) throw new Error("swerver_init failed (see stderr)");
+    this.#ffiHandle = handle;
+
+    // Register each dynamic handler prefix as an FFI route.
+    this.#prefixes().forEach((prefix, i) => {
+      const pat = new TextEncoder().encode(prefix);
+      lib.route(handle, ptr(pat), BigInt(pat.length), i);
+    });
+
+    if (lib.start(handle) !== 0) throw new Error("swerver_start failed");
+
+    this.#ffiRunning = true;
+    void this.#ffiPump(lib, ordered, validateResponses);
+
+    // Reap the embedded server if the process exits without stop().
+    const onExit = () => {
+      if (this.#ffiHandle !== 0) lib.stop(this.#ffiHandle);
+    };
+    process.on("exit", onExit);
+    this.#cleanup = () => process.removeListener("exit", onExit);
+
+    await this.#waitForPort(port, this.#opts.readyTimeoutMs ?? 5000);
+
+    return {
+      port,
+      url: `http://${this.#opts.address ?? "localhost"}:${port}`,
+      stop: async () => {
+        this.#ffiRunning = false;
+        this.#cleanup?.();
+        await sleep(5); // let the pump observe running=false and settle
+        if (this.#ffiHandle !== 0) {
+          lib.stop(this.#ffiHandle);
+          this.#ffiHandle = 0;
+        }
+        lib.close();
+        this.#started = false;
+      },
+    };
+  }
+
+  async #ffiPump(
+    lib: Lib,
+    ordered: CompiledRoute<AnyHandler>[],
+    validateResponses: boolean,
+  ): Promise<void> {
+    const slab = new BigUint64Array(6);
+    const slabPtr = ptr(slab.buffer);
+    while (this.#ffiRunning) {
+      let reqId = lib.poll();
+      while (reqId !== 0n) {
+        // Fire without awaiting so async handlers overlap; each answers itself.
+        // The request is read synchronously (below) before any await, so the
+        // shared slab is safe.
+        void this.#handleFfi(lib, reqId, slab, slabPtr, ordered, validateResponses);
+        reqId = lib.poll();
+      }
+      await sleep(0);
+    }
+  }
+
+  async #handleFfi(
+    lib: Lib,
+    reqId: bigint,
+    slab: BigUint64Array,
+    slabPtr: number,
+    ordered: CompiledRoute<AnyHandler>[],
+    validateResponses: boolean,
+  ): Promise<void> {
+    // Read the request synchronously into JS values before any await.
+    if (lib.request(reqId, slabPtr) !== 0) return;
+    const method = readSlice(slab[0]!, slab[1]!);
+    const path = readSlice(slab[2]!, slab[3]!);
+    const bodyLen = Number(slab[5]!);
+    const body =
+      bodyLen > 0 ? new Uint8Array(toArrayBuffer(Number(slab[4]!), 0, bodyLen)).slice() : undefined;
+
+    let status = 500;
+    let ctype = "text/plain";
+    let out = new Uint8Array(0);
+    try {
+      const hasBody = body !== undefined && method !== "GET" && method !== "HEAD";
+      const req = new Request(`http://ffi.local${path}`, {
+        method,
+        ...(hasBody ? { body } : {}),
+      });
+      const res = await this.#dispatch(req, ordered, validateResponses);
+      status = res.status;
+      ctype = res.headers.get("content-type") ?? "";
+      out = new Uint8Array(await res.arrayBuffer());
+    } catch (err) {
+      console.error("swerverts ffi handler error:", err);
+      status = 500;
+      ctype = "text/plain";
+      out = new TextEncoder().encode("internal error");
+    }
+    const ct = new TextEncoder().encode(ctype);
+    lib.respond(reqId, status, ptr(ct), BigInt(ct.length), ptr(out), BigInt(out.length));
+  }
+
   async #waitForPort(port: number, timeoutMs: number): Promise<void> {
     const deadline = Date.now() + timeoutMs;
     let lastErr: unknown;
@@ -601,6 +741,13 @@ export class Swerver<R extends RouteTable = {}> {
     }
     this.#started = false;
   }
+}
+
+const _ffiDecoder = new TextDecoder();
+/** Decode a UTF-8 slice given a pointer and length (both from the FFI slab). */
+function readSlice(p: bigint, len: bigint): string {
+  if (len === 0n) return "";
+  return _ffiDecoder.decode(toArrayBuffer(Number(p), 0, Number(len)));
 }
 
 function sleep(ms: number): Promise<void> {
