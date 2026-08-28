@@ -60,19 +60,19 @@ export const APP_UPSTREAM = "__swerverts_app";
 
 export interface GenerateInput {
   port: number;
-  address?: string;
-  workers?: number;
-  staticRoot?: string;
+  address?: string | undefined;
+  workers?: number | undefined;
+  staticRoot?: string | undefined;
   appSocket: string;
   // Distinct swerver path prefixes derived from the app's dynamic routes.
   appPrefixes: string[];
   // Upstreams and routes declared through the typed builder (app.upstream /
   // app.proxy). Concatenated with the generated app upstream and the raw ones.
-  upstreams?: Upstream[];
-  routes?: Route[];
+  upstreams?: Upstream[] | undefined;
+  routes?: Route[] | undefined;
   // Merged over the generated config; wins on conflicts. Use for tls, and
   // anything else swerverts does not model.
-  raw?: Partial<SwerverConfig>;
+  raw?: Partial<SwerverConfig> | undefined;
 }
 
 export function generateConfig(input: GenerateInput): SwerverConfig {

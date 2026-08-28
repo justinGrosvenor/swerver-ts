@@ -76,32 +76,71 @@ app.get("/files/*", (_req, { params }) => new Response(params.rest));
 and a path that matches with the wrong method returns `405` with an `Allow`
 header.
 
-### Typed, validated request bodies
+### Typed, validated inputs and outputs
 
-Pass `{ body: schema }` to `route`/`post`/`put`/`patch`. `schema` is any
-[Standard Schema](https://standardschema.dev) (Zod, Valibot, ArkType, ...), so
-there is no library lock-in. The body is parsed and validated before your
-handler runs: `ctx.body` is the schema's output type, an invalid body returns
-`422` with the failing issues, and a non-JSON body returns `400`.
+Pass a config object before the handler on `route`/`post`/`put`/`patch` (and
+`get`/`delete`). Every field is any [Standard Schema](https://standardschema.dev)
+(Zod, Valibot, ArkType, ...), so there is no library lock-in:
+
+- `body` - JSON body, parsed and validated; `ctx.body` is its output type
+- `query` - URL query params; `ctx.query` is its output type
+- `headers` - request headers (lower-cased); `ctx.headers` is its output type
+- `response` - types `ctx.json(...)` so you cannot return the wrong shape
 
 ```ts
 import { z } from "zod";
 
 const CreateUser = z.object({ name: z.string(), age: z.number().int().min(0) });
+const UserOut = z.object({ id: z.string(), name: z.string() });
 
-app.post("/users/:id", { body: CreateUser }, (_req, { params, body }) => {
-  params.id;   // string  (from the pattern)
-  body.name;   // string  (from the schema)
-  body.age;    // number
-  return Response.json({ id: params.id, ...body });
-});
+app.post(
+  "/users/:id",
+  { body: CreateUser, query: z.object({ dry: z.string() }), response: UserOut },
+  (_req, ctx) => {
+    ctx.params.id;   // string   (from the pattern)
+    ctx.body.name;   // string   (from body schema)
+    ctx.query.dry;   // string   (from query schema)
+    return ctx.json({ id: ctx.params.id, name: ctx.body.name }); // checked against UserOut
+  },
+);
 ```
 
-A rejected body responds with:
+An invalid body/query/headers returns `422` with the failing issues; a non-JSON
+body returns `400`:
 
 ```json
 { "error": "validation failed", "issues": [ { "message": "...", "path": "age" } ] }
 ```
+
+### Typed client
+
+`app.client(baseUrl?)` returns a fetch client generated from the routes you
+registered. It knows every path, its params, its body, and its response type.
+Chain the route calls so the route table accumulates on the app's type:
+
+```ts
+const api = new Swerver({ port: 8080 })
+  .get("/users/:id", { response: UserOut }, (_r, ctx) => ctx.json({ id: ctx.params.id, name: "ada" }))
+  .post("/users", { body: CreateUser, response: UserOut }, (_r, ctx) => ctx.json({ id: "1", name: ctx.body.name }));
+
+const client = api.client("http://localhost:8080");
+
+const res = await client.post("/users", { body: { name: "grace", age: 30 } });
+const user = await res.json(); // typed: { id: string; name: string }
+
+client.get("/users/:id", { params: { id: "7" } }); // params required and typed
+client.get("/nope");                                // compile error: unknown route
+client.post("/users", { body: { name: 12 } });      // compile error: wrong body
+```
+
+### Strict TypeScript
+
+The package is written for the strict end of TypeScript and typechecks clean
+under `strict`, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`,
+`noImplicitOverride`, `noUnusedLocals/Parameters`, and
+`noPropertyAccessFromIndexSignature`. `test/types.test-d.ts` holds compile-only
+assertions (including `@ts-expect-error` for every rejection above); run them
+with `bun run typecheck`.
 
 ### Typed upstreams
 

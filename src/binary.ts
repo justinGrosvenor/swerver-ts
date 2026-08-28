@@ -31,7 +31,7 @@ export function resolveBinary(explicit?: string): string {
     }
     return explicit;
   }
-  const fromEnv = process.env.SWERVER_BIN;
+  const fromEnv = process.env["SWERVER_BIN"];
   if (fromEnv) {
     if (!existsSync(fromEnv)) {
       throw new Error(`SWERVER_BIN points at a missing file: ${fromEnv}`);

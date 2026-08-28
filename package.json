@@ -15,7 +15,8 @@
   "files": ["src", "README.md"],
   "scripts": {
     "example": "bun run examples/hello.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "tsc --noEmit"
   },
   "keywords": ["swerver", "gateway", "http", "proxy", "bun"],
   "license": "MIT",

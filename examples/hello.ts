@@ -14,10 +14,12 @@ app.post("/echo", async (req) => {
   return new Response(body || "(empty)", { headers: { "content-type": "text/plain" } });
 });
 
-// Validated body: ctx.body is typed from the schema; an invalid body -> 422.
+// Validated body + typed response: ctx.body is typed from the schema, an
+// invalid body -> 422, and ctx.json is checked against the response schema.
 const CreateUser = z.object({ name: z.string(), age: z.number().int().min(0) });
-app.post("/users/:id", { body: CreateUser }, (_req, { params, body }) =>
-  Response.json({ id: params.id, name: body.name, age: body.age }),
+const UserOut = z.object({ id: z.string(), name: z.string(), age: z.number() });
+app.post("/users/:id", { body: CreateUser, response: UserOut }, (_req, ctx) =>
+  ctx.json({ id: ctx.params.id, name: ctx.body.name, age: ctx.body.age }),
 );
 
 // Declare an upstream and proxy a prefix to it. `api` is an unforgeable token;

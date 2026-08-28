@@ -27,7 +27,15 @@ export type ParamsOf<P extends string> = { [K in ParamNames<P>]: string };
 /** Runtime params are a plain string map; the typed view narrows the keys. */
 export type Params = Record<string, string>;
 
-import type { StandardSchemaV1 } from "./schema.ts";
+import type { Schema } from "./schema.ts";
+
+/** Optional validators attached to a route, each any Standard Schema. */
+export interface RouteSchemas {
+  body?: Schema | undefined;
+  query?: Schema | undefined;
+  headers?: Schema | undefined;
+  response?: Schema | undefined;
+}
 
 export interface CompiledRoute<H> {
   pattern: string;
@@ -36,10 +44,10 @@ export interface CompiledRoute<H> {
   handler: H;
   // Optional HTTP method constraint (set by app.get/post/...). Undefined means
   // the route matches any method.
-  method?: string;
-  // Optional request-body schema; when present the dispatcher validates the
-  // JSON body before calling the handler.
-  schema?: StandardSchemaV1;
+  method?: string | undefined;
+  // Request-body / query / header / response validators. The dispatcher runs
+  // body, query, and headers before the handler.
+  schemas: RouteSchemas;
   // The static leading path, up to the first ":" or "*". This is what swerver
   // matches on as a route path_prefix.
   prefix: string;
@@ -58,7 +66,7 @@ export function compile<H>(
   pattern: string,
   handler: H,
   method?: string,
-  schema?: StandardSchemaV1,
+  schemas: RouteSchemas = {},
 ): CompiledRoute<H> {
   const paramNames: string[] = [];
   const source = pattern
@@ -78,7 +86,7 @@ export function compile<H>(
     paramNames,
     handler,
     method,
-    schema,
+    schemas,
     prefix: literalPrefix(pattern),
   };
 }
@@ -109,7 +117,8 @@ export function match<H>(routes: CompiledRoute<H>[], path: string, method: strin
     route.paramNames.forEach((name, i) => {
       params[name] = decodeURIComponent(m[i + 1] ?? "");
     });
-    if (m.groups?.rest !== undefined) params.rest = m.groups.rest;
+    const rest = m.groups?.["rest"];
+    if (rest !== undefined) params["rest"] = rest;
     return { kind: "ok", route, params };
   }
   if (methodMismatch.size > 0) return { kind: "method", allowed: [...methodMismatch] };

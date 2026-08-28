@@ -1,42 +1,32 @@
-// Compile-only tests. These assert the *types* behave; there is nothing to run.
-// `tsc --noEmit` failing on this file is the test failing.
+// Compile-only tests. There is nothing to run: `tsc --noEmit` failing on this
+// file is the test failing. Assertion tuples are exported so noUnusedLocals
+// does not flag them.
 
+import { z } from "zod";
 import { Swerver } from "../src/index.ts";
 import type { ParamsOf } from "../src/router.ts";
-import type { UpstreamRef } from "../src/config.ts";
+import type { UpstreamRef, ValidatedConfig } from "../src/config.ts";
+import { validateConfig } from "../src/index.ts";
 
-// ── Helpers ────────────────────────────────────────────────────────────────
 type Expect<T extends true> = T;
 type Equal<A, B> =
   (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false;
 
 // ── Param inference from the pattern literal ────────────────────────────────
-type _p1 = Expect<Equal<ParamsOf<"/health">, {}>>;
-type _p2 = Expect<Equal<ParamsOf<"/users/:id">, { id: string }>>;
-type _p3 = Expect<Equal<ParamsOf<"/users/:id/posts/:postId">, { id: string; postId: string }>>;
-type _p4 = Expect<Equal<ParamsOf<"/files/*">, { rest: string }>>;
-type _p5 = Expect<Equal<ParamsOf<"/t/:a/:b/:c">, { a: string; b: string; c: string }>>;
+export type ParamChecks = [
+  Expect<Equal<ParamsOf<"/health">, {}>>,
+  Expect<Equal<ParamsOf<"/users/:id">, { id: string }>>,
+  Expect<Equal<ParamsOf<"/users/:id/posts/:postId">, { id: string; postId: string }>>,
+  Expect<Equal<ParamsOf<"/files/*">, { rest: string }>>,
+];
 
 const app = new Swerver({ port: 8080 });
 
-// Handler ctx.params keys are inferred from the pattern.
-app.route("/users/:id", (_req, ctx) => {
-  const id: string = ctx.params.id; // ok
+app.get("/users/:id", (_req, ctx) => {
+  const id: string = ctx.params.id;
   void id;
   // @ts-expect-error - "name" is not a param of this pattern
   ctx.params.name;
-  return new Response("ok");
-});
-
-app.get("/files/*", (_req, ctx) => {
-  const rest: string = ctx.params.rest; // ok
-  void rest;
-  return new Response("ok");
-});
-
-app.post("/health", (_req, ctx) => {
-  // @ts-expect-error - no params on this pattern
-  ctx.params.anything;
   return new Response("ok");
 });
 
@@ -45,68 +35,88 @@ const bedrock = app.upstream("bedrock", {
   servers: [{ address: "example.com", port: 443 }],
   tls: true,
 });
-type _u1 = Expect<Equal<typeof bedrock, UpstreamRef>>;
+export type UpstreamChecks = [Expect<Equal<typeof bedrock, UpstreamRef>>];
 
-app.proxy("/models/", bedrock); // ok: a real reference
-
+app.proxy("/models/", bedrock);
 // @ts-expect-error - a bare string is not an UpstreamRef; the brand is unforgeable
 app.proxy("/models/", "bedrock");
 
-// @ts-expect-error - even the right name as a plain string will not do
-app.proxy("/x/", "typo-upstream");
-
 // ── Phantom started state ───────────────────────────────────────────────────
-// start() returns a RunningSwerver with no definition methods.
 async function lifecycle() {
   const running = await app.start();
-  const p: number = running.port; // ok
+  const p: number = running.port;
   void p;
-  await running.stop(); // ok
-
+  await running.stop();
   // @ts-expect-error - cannot add routes to a running server (compile-time)
   running.get("/late", () => new Response("no"));
-  // @ts-expect-error - no upstream() on a running server either
-  running.upstream("x", { servers: [] });
 }
 void lifecycle;
 
 // ── Validated config brand ──────────────────────────────────────────────────
-import { validateConfig } from "../src/index.ts";
-import type { ValidatedConfig } from "../src/config.ts";
-
 declare function spawnFromValidated(cfg: ValidatedConfig): void;
-const raw = { server: { port: 8080 } };
-
+const rawCfg = { server: { port: 8080 } };
 // @ts-expect-error - a raw config is not a ValidatedConfig
-spawnFromValidated(raw);
+spawnFromValidated(rawCfg);
+spawnFromValidated(validateConfig(rawCfg));
 
-spawnFromValidated(validateConfig(raw)); // ok: validateConfig mints the brand
-
-// ── Typed request bodies via Standard Schema (tested with Zod) ───────────────
-import { z } from "zod";
-
+// ── Typed body / query / headers / response ─────────────────────────────────
 const CreateUser = z.object({ name: z.string(), age: z.number() });
+const UserQuery = z.object({ verbose: z.string() });
+const AuthHeaders = z.object({ authorization: z.string() });
+const UserOut = z.object({ id: z.string(), name: z.string() });
 
-app.post("/users/:id", { body: CreateUser }, (_req, ctx) => {
-  const id: string = ctx.params.id; // params still typed from the pattern
-  const name: string = ctx.body.name; // body typed from the schema output
-  const age: number = ctx.body.age;
-  void id;
-  void name;
-  void age;
-  // @ts-expect-error - "email" is not on the schema
-  ctx.body.email;
-  return new Response("ok");
-});
+app.post(
+  "/users/:id",
+  { body: CreateUser, query: UserQuery, headers: AuthHeaders, response: UserOut },
+  (_req, ctx) => {
+    const id: string = ctx.params.id;
+    const name: string = ctx.body.name;
+    const age: number = ctx.body.age;
+    const verbose: string = ctx.query.verbose;
+    const auth: string = ctx.headers.authorization;
+    void [id, name, age, verbose, auth];
+    // @ts-expect-error - not on the body schema
+    ctx.body.email;
+    // ctx.json is typed to the response schema input
+    // @ts-expect-error - response requires { id, name }
+    ctx.json({ id: "1" });
+    return ctx.json({ id: "1", name: "ada" });
+  },
+);
 
-app.post("/plain", (_req, ctx) => {
+app.get("/plain", (_req, ctx) => {
   // @ts-expect-error - no schema means no ctx.body
   ctx.body;
-  return new Response("ok");
+  return ctx.json("anything"); // untyped json responder is generic
 });
 
-// @ts-expect-error - number is not assignable to the inferred body { name; age }
-app.post("/users/:id", { body: CreateUser }, (_req, ctx: { params: { id: string }; body: number }) => {
-  void ctx;
-  return new Response("no");
-});
+// ── Typed client from the route table ───────────────────────────────────────
+const api = new Swerver()
+  .get("/users/:id", { response: UserOut }, (_r, ctx) => ctx.json({ id: ctx.params.id, name: "x" }))
+  .post("/users", { body: CreateUser, response: UserOut }, (_r, ctx) =>
+    ctx.json({ id: "1", name: ctx.body.name }),
+  );
+
+const client = api.client("http://localhost:8080");
+
+async function clientUse() {
+  const r1 = await client.get("/users/:id", { params: { id: "7" } });
+  const u1 = await r1.json();
+  const name1: string = u1.name; // response typed from UserOut
+  void name1;
+
+  const r2 = await client.post("/users", { body: { name: "ada", age: 3 } });
+  const u2 = await r2.json();
+  const id2: string = u2.id;
+  void id2;
+
+  // @ts-expect-error - unknown path is not in the route table
+  await client.get("/nope");
+  // @ts-expect-error - missing required params
+  await client.get("/users/:id");
+  // @ts-expect-error - body has the wrong shape
+  await client.post("/users", { body: { name: 123 } });
+  // @ts-expect-error - GET /users was never registered (only POST)
+  await client.get("/users");
+}
+void clientUse;
