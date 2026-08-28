@@ -38,6 +38,7 @@ import { createClient, type Client } from "./client.ts";
 import { buildOpenApi, type OpenApiDocument, type OpenApiOptions } from "./openapi.ts";
 import { loadLib, resolveLib, ptr, toArrayBuffer, type Lib } from "./ffi.ts";
 import {
+  HttpError,
   responseInit,
   runMiddleware,
   serializeCookie,
@@ -130,10 +131,20 @@ export type CtxFor<P extends string, O extends RouteConfig> = Omit<ResponseHelpe
   (O extends { query: Schema } ? { query: OutputAt<O, "query"> } : {}) &
   (O extends { headers: Schema } ? { headers: OutputAt<O, "headers"> } : {});
 
+/**
+ * What a handler may return. A Response (or ctx.json(...)) is used as-is; an
+ * HttpError becomes its status+body; any other value is the response body
+ * (objects/arrays -> JSON, strings -> text, undefined -> 204). When a response
+ * schema is declared, a returned body is typed to it.
+ */
+type ImplicitReturn<O extends RouteConfig> =
+  [ResponseSchemas<O>] extends [never] ? unknown : ResponseInput<O>;
+type HandlerResult<O extends RouteConfig> = Response | HttpError | ImplicitReturn<O>;
+
 export type HandlerFor<P extends string, O extends RouteConfig> = (
   req: Request,
   ctx: CtxFor<P, O>,
-) => Response | Promise<Response>;
+) => HandlerResult<O> | Promise<HandlerResult<O>>;
 
 /** Back-compat aliases for the no-schema case. */
 export type Ctx<P extends string = string> = CtxFor<P, {}>;
@@ -168,7 +179,9 @@ export type Add<
 
 // Internal, erased handler shape for storage and dispatch.
 type AnyCtx = MiddlewareContext & { readonly responseHeaders: Headers };
-type AnyHandler = (req: Request, ctx: AnyCtx) => Response | Promise<Response>;
+// Handlers may return a Response, an HttpError, or any value (the body); the
+// dispatcher normalizes it via toResponse.
+type AnyHandler = (req: Request, ctx: AnyCtx) => unknown;
 
 const METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] as const;
 export type Method = (typeof METHODS)[number];
@@ -693,7 +706,7 @@ export class Swerver<R extends RouteTable = {}> {
           ctx.headers = result.value;
         }
 
-        let response = await route.handler(req, ctx);
+        let response = toResponse(await route.handler(req, ctx), ctx);
         const responseSchema = route.schemas.responses?.[response.status] ?? route.schemas.response;
         if (validateResponses && responseSchema && Reflect.has(response, RESPONSE_DATA)) {
           const data = Reflect.get(response, RESPONSE_DATA);
@@ -717,8 +730,12 @@ export class Swerver<R extends RouteTable = {}> {
       return req.method === "HEAD"
         ? new Response(null, { status: decorated.status, statusText: decorated.statusText, headers: decorated.headers })
         : decorated;
-    } catch (error) {
-      const response = await this.#errorHandler(error, req, ctx);
+    } catch (err) {
+      // A thrown HttpError is a controlled response (status + body), not an
+      // unexpected failure, so it goes straight to a response and skips onError.
+      const response = err instanceof HttpError
+        ? httpErrorToResponse(err)
+        : await this.#errorHandler(err, req, ctx);
       const decorated = applyResponseHeaders(response, responseHeaders);
       return req.method === "HEAD"
         ? new Response(null, { status: decorated.status, statusText: decorated.statusText, headers: decorated.headers })
@@ -1462,6 +1479,29 @@ function copyHeaders(source: Headers, target: Headers): void {
   }
 }
 
+/** Normalize a handler's return value into a Response: a Response (or ctx.json)
+ *  is used as-is, an HttpError becomes its status+body, a string is text, and
+ *  any other value is the JSON body. undefined means 204 No Content. */
+function toResponse(out: unknown, ctx: AnyCtx): Response {
+  if (out instanceof Response) return out;
+  if (out instanceof HttpError) return httpErrorToResponse(out);
+  if (out === undefined) return new Response(null, { status: 204 });
+  if (typeof out === "string") return ctx.text(out);
+  return ctx.json(out);
+}
+
+/** Turn an HttpError into a response: object bodies serialize to JSON, strings
+ *  (and a bare status) to text. Any headers on the error are preserved. */
+function httpErrorToResponse(err: HttpError): Response {
+  const headers = new Headers(err.headers);
+  if (err.body === undefined || typeof err.body === "string") {
+    if (!headers.has("content-type")) headers.set("content-type", "text/plain; charset=utf-8");
+    return new Response(err.body ?? err.message, { status: err.status, headers });
+  }
+  if (!headers.has("content-type")) headers.set("content-type", "application/json;charset=utf-8");
+  return new Response(JSON.stringify(err.body), { status: err.status, headers });
+}
+
 function jsonError(status: number, message: string): Response {
   return new Response(JSON.stringify({ error: message }), {
     status,
@@ -1537,6 +1577,7 @@ export type { Client, ClientResponse } from "./client.ts";
 export { buildOpenApi } from "./openapi.ts";
 export type { OpenApiDocument, OpenApiOptions } from "./openapi.ts";
 export type { FetchLike } from "./client.ts";
+export { HttpError, error } from "./framework.ts";
 export type {
   CookieOptions,
   ErrorHandler,

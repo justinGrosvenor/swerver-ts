@@ -29,6 +29,27 @@ export interface MiddlewareContext extends ResponseHelpers {
   headers?: unknown;
 }
 
+/**
+ * An HTTP error a handler can `throw` or `return`. The dispatcher turns it into
+ * a response with this status and body (JSON for objects, text for strings),
+ * bypassing the error handler. Use `error(status, body?)` to build one.
+ */
+export class HttpError extends Error {
+  constructor(
+    readonly status: number,
+    readonly body?: unknown,
+    readonly headers?: HeadersInit,
+  ) {
+    super(typeof body === "string" ? body : `HTTP ${status}`);
+    this.name = "HttpError";
+  }
+}
+
+/** Build an HttpError: `throw error(404, "not found")` or `return error(400, { field: "bad" })`. */
+export function error(status: number, body?: unknown, headers?: HeadersInit): HttpError {
+  return new HttpError(status, body, headers);
+}
+
 export type Next = () => Promise<Response>;
 export type Middleware = (
   request: Request,

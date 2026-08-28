@@ -51,16 +51,34 @@ const app = new Swerver({
 });
 
 // params is typed from the pattern: { name: string } here.
-app.get("/hello/:name", (_req, { params }) =>
-  Response.json({ hi: params.name }),
-);
+// Return a plain value: objects become JSON, strings become text. params is
+// typed from the pattern ({ name: string } here).
+app.get("/hello/:name", (_req, { params }) => ({ hi: params.name }));
 
-app.post("/echo", async (req) => {
-  const body = await req.text();
-  return new Response(body, { headers: { "content-type": "text/plain" } });
-});
+app.post("/echo", async (req) => (await req.text()) || "(empty)");
 
 await app.start();
+```
+
+### Responses and errors
+
+A handler can return a value and swerverts builds the response: objects and
+arrays become JSON, strings become `text/plain`, `undefined` is `204`, and a
+`Response` (or `ctx.json(...)` / `ctx.text(...)`) is used as-is when you need to
+set a status or headers. When a route declares a `response` schema, the returned
+value is type-checked against it and validated at runtime.
+
+For a controlled error status, throw or return an `HttpError` via `error()`. Its
+body is JSON for objects and text for strings, and it skips the error handler.
+
+```ts
+import { Swerver, error } from "swerverts";
+
+const app = new Swerver().get("/users/:id", (_req, { params }) => {
+  const user = db.get(params.id);
+  if (!user) throw error(404, "user not found");
+  return user; // -> 200 application/json
+});
 ```
 
 ### Middleware and response helpers
