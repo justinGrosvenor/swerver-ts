@@ -17,8 +17,11 @@ export interface Lib {
   abiVersion(): number;
   init(cfgPtr: number, cfgLen: bigint): number;
   route(handle: number, patternPtr: number, patternLen: bigint, routeId: number): number;
+  wakeConnect(handle: number, pathPtr: number, pathLen: bigint): number;
+  wakeClear(): void;
   poll(): bigint;
   request(reqId: bigint, outPtr: number): number;
+  requestHeaders(reqId: bigint, outPtr: number): number;
   // Lengths are passed as plain numbers: bun:ffi accepts a JS number for a u64
   // *argument* (only 64-bit returns must be bigint), which avoids boxing a
   // BigInt per response. reqId stays bigint (it came from a u64 return).
@@ -30,7 +33,27 @@ export interface Lib {
     bodyPtr: number,
     bodyLen: number,
   ): number;
+  respondFull(
+    reqId: bigint,
+    status: number,
+    headersPtr: number,
+    headersLen: number,
+    bodyPtr: number,
+    bodyLen: number,
+  ): number;
+  // Answer with the body already written into the slot's response buffer (via
+  // the resp_ptr from `request`) — no body copy.
+  respondInplace(reqId: bigint, status: number, ctypePtr: number, ctypeLen: number, bodyLen: number): number;
+  respondInplaceFull(
+    reqId: bigint,
+    status: number,
+    headersPtr: number,
+    headersLen: number,
+    bodyLen: number,
+  ): number;
   start(handle: number): number;
+  shutdown(handle: number): void;
+  pending(): number;
   stop(handle: number): void;
   close(): void;
 }
@@ -60,27 +83,62 @@ export function resolveLib(explicit?: string): string {
 
 const T = FFIType;
 
+/** libswerver C ABI version this client is built against. dlopen fails on an
+ * older library that lacks the newer symbols, but check explicitly for a clear
+ * error rather than a cryptic missing-symbol failure. */
+export const EXPECTED_ABI = 5;
+
 export function loadLib(libPath: string): Lib {
   const { symbols, close } = dlopen(libPath, {
     swerver_abi_version: { args: [], returns: T.u32 },
     swerver_init: { args: [T.ptr, T.u64], returns: T.ptr },
     swerver_route: { args: [T.ptr, T.ptr, T.u64, T.u32], returns: T.i32 },
+    swerver_wake_connect: { args: [T.ptr, T.ptr, T.u64], returns: T.i32 },
+    swerver_wake_clear: { args: [], returns: T.void },
     swerver_poll: { args: [], returns: T.u64 },
     swerver_request: { args: [T.u64, T.ptr], returns: T.i32 },
+    swerver_request_headers: { args: [T.u64, T.ptr], returns: T.i32 },
     swerver_respond: { args: [T.u64, T.u16, T.ptr, T.u64, T.ptr, T.u64], returns: T.i32 },
+    swerver_respond_full: { args: [T.u64, T.u16, T.ptr, T.u64, T.ptr, T.u64], returns: T.i32 },
+    swerver_respond_inplace: { args: [T.u64, T.u16, T.ptr, T.u64, T.u64], returns: T.i32 },
+    swerver_respond_inplace_full: { args: [T.u64, T.u16, T.ptr, T.u64, T.u64], returns: T.i32 },
     swerver_start: { args: [T.ptr], returns: T.i32 },
+    swerver_shutdown: { args: [T.ptr], returns: T.void },
+    swerver_pending: { args: [], returns: T.u32 },
     swerver_stop: { args: [T.ptr], returns: T.void },
   });
   const s = symbols;
+  const abi = s["swerver_abi_version"]!() as number;
+  if (abi !== EXPECTED_ABI) {
+    close();
+    throw new Error(
+      `libswerver ABI mismatch: loaded ${abi}, this client expects ${EXPECTED_ABI} (${libPath})`,
+    );
+  }
   return {
     abiVersion: () => s["swerver_abi_version"]!() as number,
     init: (c, l) => (s["swerver_init"]!(c as never, l as never) as number | null) ?? 0,
     route: (h, p, l, id) => s["swerver_route"]!(h as never, p as never, l as never, id as never) as number,
+    wakeConnect: (h, p, l) => s["swerver_wake_connect"]!(h as never, p as never, l as never) as number,
+    wakeClear: () => {
+      s["swerver_wake_clear"]!();
+    },
     poll: () => s["swerver_poll"]!() as bigint,
     request: (r, o) => s["swerver_request"]!(r as never, o as never) as number,
+    requestHeaders: (r, o) => s["swerver_request_headers"]!(r as never, o as never) as number,
     respond: (r, st, cp, cl, bp, bl) =>
       s["swerver_respond"]!(r as never, st as never, cp as never, cl as never, bp as never, bl as never) as number,
+    respondFull: (r, st, hp, hl, bp, bl) =>
+      s["swerver_respond_full"]!(r as never, st as never, hp as never, hl as never, bp as never, bl as never) as number,
+    respondInplace: (r, st, cp, cl, bl) =>
+      s["swerver_respond_inplace"]!(r as never, st as never, cp as never, cl as never, bl as never) as number,
+    respondInplaceFull: (r, st, hp, hl, bl) =>
+      s["swerver_respond_inplace_full"]!(r as never, st as never, hp as never, hl as never, bl as never) as number,
     start: (h) => s["swerver_start"]!(h as never) as number,
+    shutdown: (h) => {
+      s["swerver_shutdown"]!(h as never);
+    },
+    pending: () => s["swerver_pending"]!() as number,
     stop: (h) => {
       s["swerver_stop"]!(h as never);
     },

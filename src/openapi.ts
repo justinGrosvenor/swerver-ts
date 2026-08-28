@@ -82,7 +82,7 @@ export function buildOpenApi(
 
     const oaPath = toOpenApiPath(route.pattern);
     const item = paths[oaPath] ?? (paths[oaPath] = {});
-    const { body, query, headers, response } = route.schemas;
+    const { body, query, headers, response, responses: declaredResponses } = route.schemas;
 
     const parameters: Parameter[] = [
       ...pathParams(route.pattern),
@@ -90,15 +90,30 @@ export function buildOpenApi(
       ...(headers ? schemaToParams(headers, "header", toJsonSchema) : []),
     ];
 
-    const responses: Record<string, unknown> = {
-      "200": response
+    const responses: Record<string, unknown> = {};
+    if (declaredResponses) {
+      for (const [status, schema] of Object.entries(declaredResponses)) {
+        responses[status] = {
+          description: responseDescription(Number(status)),
+          content: jsonContent(schema, toJsonSchema),
+        };
+      }
+    } else {
+      responses["200"] = response
         ? { description: "OK", content: jsonContent(response, toJsonSchema) }
-        : { description: "OK" },
-    };
-    if (body) responses["400"] = { description: "Invalid JSON body" };
-    if (body || query || headers) responses["422"] = { description: "Validation failed" };
+        : { description: "OK" };
+    }
+    if (body && !responses["400"]) responses["400"] = { description: "Invalid JSON body" };
+    if ((body || query || headers) && !responses["422"]) {
+      responses["422"] = { description: "Validation failed" };
+    }
 
     const operation: Record<string, unknown> = { responses };
+    if (route.schemas.summary) operation["summary"] = route.schemas.summary;
+    if (route.schemas.description) operation["description"] = route.schemas.description;
+    if (route.schemas.operationId) operation["operationId"] = route.schemas.operationId;
+    if (route.schemas.tags) operation["tags"] = route.schemas.tags;
+    if (route.schemas.deprecated !== undefined) operation["deprecated"] = route.schemas.deprecated;
     if (parameters.length > 0) operation["parameters"] = parameters;
     if (body) {
       operation["requestBody"] = { required: true, content: jsonContent(body, toJsonSchema) };
@@ -117,4 +132,12 @@ export function buildOpenApi(
     ...(options.servers ? { servers: options.servers } : {}),
     paths,
   };
+}
+
+function responseDescription(status: number): string {
+  if (status >= 200 && status < 300) return "Success";
+  if (status >= 300 && status < 400) return "Redirect";
+  if (status >= 400 && status < 500) return "Client error";
+  if (status >= 500) return "Server error";
+  return "Response";
 }

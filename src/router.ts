@@ -28,6 +28,7 @@ export type ParamsOf<P extends string> = { [K in ParamNames<P>]: string };
 export type Params = Record<string, string>;
 
 import type { Schema } from "./schema.ts";
+import type { Middleware } from "./framework.ts";
 
 /** Optional validators attached to a route, each any Standard Schema. */
 export interface RouteSchemas {
@@ -35,6 +36,13 @@ export interface RouteSchemas {
   query?: Schema | undefined;
   headers?: Schema | undefined;
   response?: Schema | undefined;
+  responses?: Readonly<Record<number, Schema>> | undefined;
+  middleware?: readonly Middleware[] | undefined;
+  summary?: string | undefined;
+  description?: string | undefined;
+  operationId?: string | undefined;
+  tags?: readonly string[] | undefined;
+  deprecated?: boolean | undefined;
 }
 
 export interface CompiledRoute<H> {
@@ -109,21 +117,39 @@ export type MatchResult<H> =
 
 export function match<H>(routes: CompiledRoute<H>[], path: string, method: string): MatchResult<H> {
   const methodMismatch = new Set<string>();
+  let headFallback: { route: CompiledRoute<H>; match: RegExpExecArray } | undefined;
   for (const route of routes) {
     const m = route.regex.exec(path);
     if (!m) continue;
-    if (route.method && route.method !== method) {
-      methodMismatch.add(route.method);
+    if (method === "HEAD" && route.method === "GET") {
+      headFallback ??= { route, match: m };
+      methodMismatch.add("HEAD");
       continue;
     }
-    const params: Params = {};
-    route.paramNames.forEach((name, i) => {
-      params[name] = decodeURIComponent(m[i + 1] ?? "");
-    });
-    const rest = m.groups?.["rest"];
-    if (rest !== undefined) params["rest"] = rest;
-    return { kind: "ok", route, params };
+    if (route.method && route.method !== method) {
+      methodMismatch.add(route.method);
+      if (route.method === "GET") methodMismatch.add("HEAD");
+      continue;
+    }
+    return { kind: "ok", route, params: matchedParams(route, m) };
+  }
+  if (headFallback) {
+    return {
+      kind: "ok",
+      route: headFallback.route,
+      params: matchedParams(headFallback.route, headFallback.match),
+    };
   }
   if (methodMismatch.size > 0) return { kind: "method", allowed: [...methodMismatch] };
   return { kind: "none" };
+}
+
+function matchedParams<H>(route: CompiledRoute<H>, match: RegExpExecArray): Params {
+  const params: Params = {};
+  route.paramNames.forEach((name, index) => {
+    params[name] = decodeURIComponent(match[index + 1] ?? "");
+  });
+  const rest = match.groups?.["rest"];
+  if (rest !== undefined) params["rest"] = decodeURIComponent(rest);
+  return params;
 }

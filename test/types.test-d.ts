@@ -38,6 +38,7 @@ const bedrock = app.upstream("bedrock", {
 export type UpstreamChecks = [Expect<Equal<typeof bedrock, UpstreamRef>>];
 
 app.proxy("/models/", bedrock);
+app.tenant("/tenants/", { socket_dir: "/run/nether/tenants" });
 // @ts-expect-error - a bare string is not an UpstreamRef; the brand is unforgeable
 app.proxy("/models/", "bedrock");
 
@@ -145,3 +146,35 @@ async function mockUse() {
   await mock.post("/users", { body: { name: 123 } });
 }
 void mockUse;
+
+// ── Status-specific response contracts ─────────────────────────────────────
+const Found = z.object({ id: z.string() });
+const Missing = z.object({ error: z.string() });
+new Swerver().get(
+  "/status/:id",
+  { responses: { 200: Found, 404: Missing } },
+  (_request, ctx) => {
+    if (ctx.params.id === "missing") return ctx.json({ error: "missing" }, 404);
+    // @ts-expect-error - a 200 response must satisfy Found
+    ctx.json({ error: "wrong" }, 200);
+    // @ts-expect-error - a declared status is required for multi-status routes
+    ctx.json({ id: "1" });
+    return ctx.json({ id: ctx.params.id }, { status: 200, headers: { etag: "v1" } });
+  },
+);
+
+// ── Route groups accumulate into the typed client when chained ──────────────
+const grouped = new Swerver().group("/api", (apiGroup) =>
+  apiGroup
+    .get("/users/:id", { response: UserOut }, (_request, ctx) =>
+      ctx.json({ id: ctx.params.id, name: "ada" }),
+    )
+    .post("users", { body: CreateUser, response: UserOut }, (_request, ctx) =>
+      ctx.json({ id: "1", name: ctx.body.name }),
+    ),
+);
+const groupedClient = grouped.client();
+groupedClient.get("/api/users/:id", { params: { id: "7" } });
+groupedClient.post("/api/users", { body: { name: "ada", age: 3 } });
+// @ts-expect-error - the unprefixed path is not registered
+groupedClient.get("/users/:id", { params: { id: "7" } });

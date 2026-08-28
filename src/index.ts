@@ -22,7 +22,14 @@ import {
   generateConfig,
   validateConfig,
   type Route,
+  type ProxyOptions,
+  type AdminConfig,
+  type Http2Config,
+  type OtelConfig,
+  type QuicConfig,
   type SwerverConfig,
+  type TenantConfig,
+  type TlsConfig,
   type Upstream,
   type UpstreamRef,
   type ValidatedConfig,
@@ -31,11 +38,22 @@ import { createClient, type Client } from "./client.ts";
 import { buildOpenApi, type OpenApiDocument, type OpenApiOptions } from "./openapi.ts";
 import { loadLib, resolveLib, ptr, toArrayBuffer, type Lib } from "./ffi.ts";
 import {
+  responseInit,
+  runMiddleware,
+  serializeCookie,
+  type CookieOptions,
+  type ErrorHandler,
+  type MethodNotAllowedHandler,
+  type Middleware,
+  type MiddlewareContext,
+  type NotFoundHandler,
+  type ResponseHelpers,
+} from "./framework.ts";
+import {
   compile,
   match,
   sortBySpecificity,
   type CompiledRoute,
-  type Params,
   type ParamsOf,
   type RouteSchemas,
 } from "./router.ts";
@@ -60,6 +78,13 @@ export interface RouteConfig {
   query?: Schema;
   headers?: Schema;
   response?: Schema;
+  responses?: Readonly<Record<number, Schema>>;
+  middleware?: readonly Middleware[];
+  summary?: string;
+  description?: string;
+  operationId?: string;
+  tags?: readonly string[];
+  deprecated?: boolean;
 }
 
 type OutputAt<O, K extends keyof RouteConfig> =
@@ -67,19 +92,43 @@ type OutputAt<O, K extends keyof RouteConfig> =
 type InputAt<O, K extends keyof RouteConfig> =
   O extends Record<K, infer S extends Schema> ? InferInput<S> : never;
 
+type ResponseSchemas<O extends RouteConfig> = O extends {
+  responses: infer Responses extends Readonly<Record<number, Schema>>;
+}
+  ? Responses[keyof Responses]
+  : O extends { response: infer ResponseSchema extends Schema }
+    ? ResponseSchema
+    : never;
+
+type ResponseInput<O extends RouteConfig> = ResponseSchemas<O> extends infer ResponseSchema extends Schema
+  ? InferInput<ResponseSchema>
+  : never;
+
+type ResponseOutput<O extends RouteConfig> = ResponseSchemas<O> extends infer ResponseSchema extends Schema
+  ? InferOutput<ResponseSchema>
+  : unknown;
+
 /** JSON responder: typed to the response schema's input when one is declared. */
-type JsonFn<O extends RouteConfig> = O extends { response: Schema }
-  ? (data: InputAt<O, "response">) => TypedResponse<OutputAt<O, "response">>
-  : <T>(data: T) => TypedResponse<T>;
+type JsonFn<O extends RouteConfig> = O extends {
+  responses: infer Responses extends Readonly<Record<number, Schema>>;
+}
+  ? <Status extends keyof Responses & number>(
+      data: InferInput<Responses[Status]>,
+      init: Status | (ResponseInit & { status: Status }),
+    ) => TypedResponse<InferOutput<Responses[Status]>>
+  : O extends { response: Schema }
+    ? (data: ResponseInput<O>, init?: number | ResponseInit) => TypedResponse<ResponseOutput<O>>
+    : <T>(data: T, init?: number | ResponseInit) => TypedResponse<T>;
 
 /** Handler context assembled from the route pattern and its declared schemas. */
-export type CtxFor<P extends string, O extends RouteConfig> = { params: ParamsOf<P> } & (O extends {
+export type CtxFor<P extends string, O extends RouteConfig> = Omit<ResponseHelpers, "json"> &
+  { params: ParamsOf<P>; json: JsonFn<O> } & (O extends {
   body: Schema;
 }
   ? { body: OutputAt<O, "body"> }
   : {}) &
   (O extends { query: Schema } ? { query: OutputAt<O, "query"> } : {}) &
-  (O extends { headers: Schema } ? { headers: OutputAt<O, "headers"> } : {}) & { json: JsonFn<O> };
+  (O extends { headers: Schema } ? { headers: OutputAt<O, "headers"> } : {});
 
 export type HandlerFor<P extends string, O extends RouteConfig> = (
   req: Request,
@@ -106,7 +155,7 @@ export type EntryFor<P extends string, O extends RouteConfig> = {
   body: O extends { body: Schema } ? InputAt<O, "body"> : undefined;
   query: O extends { query: Schema } ? InputAt<O, "query"> : undefined;
   headers: O extends { headers: Schema } ? InputAt<O, "headers"> : undefined;
-  response: O extends { response: Schema } ? OutputAt<O, "response"> : unknown;
+  response: ResponseOutput<O>;
 };
 
 /** Add one method+pattern to a route table. */
@@ -118,13 +167,7 @@ export type Add<
 > = R & Record<`${M} ${P}`, EntryFor<P, O>>;
 
 // Internal, erased handler shape for storage and dispatch.
-type AnyCtx = {
-  params: Params;
-  body?: unknown;
-  query?: unknown;
-  headers?: unknown;
-  json: (data: unknown) => Response;
-};
+type AnyCtx = MiddlewareContext & { readonly responseHeaders: Headers };
 type AnyHandler = (req: Request, ctx: AnyCtx) => Response | Promise<Response>;
 
 const METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] as const;
@@ -150,6 +193,30 @@ export interface SwerverOptions {
   workers?: number;
   /** Serve a directory of static files (swerver handles this, not TS). */
   staticRoot?: string;
+  /** Cache static files in each native worker after first access. */
+  cacheStaticFiles?: boolean;
+  /** Disable native middleware for benchmark-only deployments. */
+  disableMiddleware?: boolean;
+  /** Enable swerver's pre-encoded response registry. */
+  preencoded?: boolean;
+  maxConnections?: number;
+  allowedHosts?: string[];
+  listeners?: SwerverConfig["server"]["listeners"];
+  timeouts?: SwerverConfig["timeouts"];
+  limits?: SwerverConfig["limits"];
+  bufferPool?: SwerverConfig["buffer_pool"];
+  tls?: TlsConfig;
+  http2?: Http2Config;
+  quic?: QuicConfig;
+  x402?: SwerverConfig["x402"];
+  admin?: AdminConfig;
+  otel?: OtelConfig;
+  postgres?: SwerverConfig["postgres"];
+  wasmFilters?: SwerverConfig["wasm_filters"];
+  wasmControlSocket?: string;
+  wasmControlConnections?: number;
+  wasmHostCallDeadlineMs?: number;
+  tenantIdleTtlMs?: number;
   /** Extra swerver config merged over the generated one (tls, upstreams, routes, ...). */
   raw?: Partial<SwerverConfig>;
   /**
@@ -171,11 +238,16 @@ export interface SwerverOptions {
    * handlers that violate their own declared response contract.
    */
   validateResponses?: boolean;
+  /** Mutable application state exposed as `ctx.state`. */
+  state?: Record<string, unknown>;
 }
 
 // ctx.json tags its Response with the pre-serialization data so the dispatcher
 // can validate it against the response schema when validateResponses is on.
 const RESPONSE_DATA = Symbol("swerverts.responseData");
+// ...and with the JSON string it already serialized, so the FFI direct-write
+// path can copy those bytes into the slot instead of stringifying a second time.
+const RESPONSE_JSON = Symbol("swerverts.responseJson");
 
 /** Options for `app.docs()`: OpenAPI options plus where to mount the pages. */
 export interface DocsOptions extends OpenApiOptions {
@@ -197,7 +269,79 @@ declare const Bun: {
   connect(opts: { hostname: string; port: number; socket: Record<string, unknown> }): Promise<{
     end(): void;
   }>;
+  listen(opts: { unix: string; socket: Record<string, unknown> }): { stop(closeActive?: boolean): void };
 };
+
+type GroupPath<Base extends string, Path extends string> = Base extends `${infer Prefix}/`
+  ? Path extends `/${infer Suffix}`
+    ? `${Prefix}/${Suffix}`
+    : `${Prefix}/${Path}`
+  : Path extends `/${string}`
+    ? `${Base}${Path}`
+    : `${Base}/${Path}`;
+type GroupRegistrar = (pattern: string, method: string | undefined, configOrHandler: unknown, handler?: unknown) => void;
+
+/** Prefix-scoped route registrar returned to `app.group()`. */
+export class RouteGroup<Base extends string, R extends RouteTable = {}> {
+  constructor(
+    private readonly base: Base,
+    private readonly registerRoute: GroupRegistrar,
+  ) {}
+
+  route<P extends string>(path: P, handler: HandlerFor<GroupPath<Base, P>, {}>): this;
+  route<P extends string, O extends RouteConfig>(path: P, config: O, handler: HandlerFor<GroupPath<Base, P>, O>): this;
+  route(path: string, configOrHandler: unknown, handler?: unknown): this {
+    this.registerRoute(joinRoutePath(this.base, path), undefined, configOrHandler, handler);
+    return this;
+  }
+
+  get<P extends string>(path: P, handler: HandlerFor<GroupPath<Base, P>, {}>): RouteGroup<Base, Add<R, "GET", GroupPath<Base, P>, {}>>;
+  get<P extends string, O extends RouteConfig>(path: P, config: O, handler: HandlerFor<GroupPath<Base, P>, O>): RouteGroup<Base, Add<R, "GET", GroupPath<Base, P>, O>>;
+  get(path: string, configOrHandler: unknown, handler?: unknown): RouteGroup<Base, any> {
+    return this.add("GET", path, configOrHandler, handler);
+  }
+
+  post<P extends string>(path: P, handler: HandlerFor<GroupPath<Base, P>, {}>): RouteGroup<Base, Add<R, "POST", GroupPath<Base, P>, {}>>;
+  post<P extends string, O extends RouteConfig>(path: P, config: O, handler: HandlerFor<GroupPath<Base, P>, O>): RouteGroup<Base, Add<R, "POST", GroupPath<Base, P>, O>>;
+  post(path: string, configOrHandler: unknown, handler?: unknown): RouteGroup<Base, any> {
+    return this.add("POST", path, configOrHandler, handler);
+  }
+
+  put<P extends string>(path: P, handler: HandlerFor<GroupPath<Base, P>, {}>): RouteGroup<Base, Add<R, "PUT", GroupPath<Base, P>, {}>>;
+  put<P extends string, O extends RouteConfig>(path: P, config: O, handler: HandlerFor<GroupPath<Base, P>, O>): RouteGroup<Base, Add<R, "PUT", GroupPath<Base, P>, O>>;
+  put(path: string, configOrHandler: unknown, handler?: unknown): RouteGroup<Base, any> {
+    return this.add("PUT", path, configOrHandler, handler);
+  }
+
+  patch<P extends string>(path: P, handler: HandlerFor<GroupPath<Base, P>, {}>): RouteGroup<Base, Add<R, "PATCH", GroupPath<Base, P>, {}>>;
+  patch<P extends string, O extends RouteConfig>(path: P, config: O, handler: HandlerFor<GroupPath<Base, P>, O>): RouteGroup<Base, Add<R, "PATCH", GroupPath<Base, P>, O>>;
+  patch(path: string, configOrHandler: unknown, handler?: unknown): RouteGroup<Base, any> {
+    return this.add("PATCH", path, configOrHandler, handler);
+  }
+
+  delete<P extends string>(path: P, handler: HandlerFor<GroupPath<Base, P>, {}>): RouteGroup<Base, Add<R, "DELETE", GroupPath<Base, P>, {}>>;
+  delete<P extends string, O extends RouteConfig>(path: P, config: O, handler: HandlerFor<GroupPath<Base, P>, O>): RouteGroup<Base, Add<R, "DELETE", GroupPath<Base, P>, O>>;
+  delete(path: string, configOrHandler: unknown, handler?: unknown): RouteGroup<Base, any> {
+    return this.add("DELETE", path, configOrHandler, handler);
+  }
+
+  head<P extends string>(path: P, handler: HandlerFor<GroupPath<Base, P>, {}>): RouteGroup<Base, Add<R, "HEAD", GroupPath<Base, P>, {}>>;
+  head<P extends string, O extends RouteConfig>(path: P, config: O, handler: HandlerFor<GroupPath<Base, P>, O>): RouteGroup<Base, Add<R, "HEAD", GroupPath<Base, P>, O>>;
+  head(path: string, configOrHandler: unknown, handler?: unknown): RouteGroup<Base, any> {
+    return this.add("HEAD", path, configOrHandler, handler);
+  }
+
+  options<P extends string>(path: P, handler: HandlerFor<GroupPath<Base, P>, {}>): RouteGroup<Base, Add<R, "OPTIONS", GroupPath<Base, P>, {}>>;
+  options<P extends string, O extends RouteConfig>(path: P, config: O, handler: HandlerFor<GroupPath<Base, P>, O>): RouteGroup<Base, Add<R, "OPTIONS", GroupPath<Base, P>, O>>;
+  options(path: string, configOrHandler: unknown, handler?: unknown): RouteGroup<Base, any> {
+    return this.add("OPTIONS", path, configOrHandler, handler);
+  }
+
+  private add(method: string, path: string, configOrHandler: unknown, handler?: unknown): this {
+    this.registerRoute(joinRoutePath(this.base, path), method, configOrHandler, handler);
+    return this;
+  }
+}
 
 export class Swerver<R extends RouteTable = {}> {
   #opts: SwerverOptions;
@@ -208,12 +352,63 @@ export class Swerver<R extends RouteTable = {}> {
   #child?: { kill(sig?: string | number): void; exited: Promise<number> };
   #tmpDir?: string;
   #started = false;
+  #closed = false;
   #cleanup?: () => void;
   #ffiHandle = 0;
-  #ffiRunning = false;
+  #wakeListener: { stop(closeActive?: boolean): void } | undefined = undefined;
+  #wakePath: string | undefined = undefined;
+  #ffiInFlight = new Set<Promise<void>>();
+  #state: Record<string, unknown>;
+  #middleware: Middleware[] = [];
+  #errorHandler: ErrorHandler = (error) => {
+    console.error("swerverts handler error:", error);
+    return new Response("internal error", { status: 500 });
+  };
+  #notFoundHandler: NotFoundHandler = () => new Response("not found", { status: 404 });
+  #methodNotAllowedHandler: MethodNotAllowedHandler = (_request, allowed) =>
+    new Response("method not allowed", { status: 405, headers: { allow: allowed.join(", ") } });
 
   constructor(opts: SwerverOptions = {}) {
     this.#opts = opts;
+    this.#state = opts.state ?? {};
+  }
+
+  /** Register global middleware in declaration order. */
+  use(middleware: Middleware): this {
+    if (this.#started) throw new Error("cannot add middleware after start()");
+    this.#middleware.push(middleware);
+    return this;
+  }
+
+  onError(handler: ErrorHandler): this {
+    if (this.#started) throw new Error("cannot change error handling after start()");
+    this.#errorHandler = handler;
+    return this;
+  }
+
+  notFound(handler: NotFoundHandler): this {
+    if (this.#started) throw new Error("cannot change error handling after start()");
+    this.#notFoundHandler = handler;
+    return this;
+  }
+
+  methodNotAllowed(handler: MethodNotAllowedHandler): this {
+    if (this.#started) throw new Error("cannot change error handling after start()");
+    this.#methodNotAllowedHandler = handler;
+    return this;
+  }
+
+  group<Base extends string, GroupRoutes extends RouteTable>(
+    base: Base,
+    register: (group: RouteGroup<Base>) => RouteGroup<Base, GroupRoutes>,
+  ): Swerver<R & GroupRoutes>;
+  group<Base extends string>(base: Base, register: (group: RouteGroup<Base>) => void): this;
+  group<Base extends string>(base: Base, register: (group: RouteGroup<Base>) => unknown): Swerver<any> {
+    if (this.#started) throw new Error("cannot add routes after start()");
+    register(new RouteGroup(base, (pattern, method, configOrHandler, handler) => {
+      this.#register(pattern, method, configOrHandler, handler);
+    }));
+    return this as unknown as Swerver<any>;
   }
 
   /**
@@ -252,6 +447,26 @@ export class Swerver<R extends RouteTable = {}> {
   ): Swerver<Add<R, "DELETE", P, O>>;
   delete(pattern: string, a: unknown, b?: unknown): Swerver<any> {
     return this.#register(pattern, "DELETE", a, b);
+  }
+
+  head<P extends string>(pattern: P, handler: HandlerFor<P, {}>): Swerver<Add<R, "HEAD", P, {}>>;
+  head<P extends string, O extends RouteConfig>(
+    pattern: P,
+    config: O,
+    handler: HandlerFor<P, O>,
+  ): Swerver<Add<R, "HEAD", P, O>>;
+  head(pattern: string, a: unknown, b?: unknown): Swerver<any> {
+    return this.#register(pattern, "HEAD", a, b);
+  }
+
+  options<P extends string>(pattern: P, handler: HandlerFor<P, {}>): Swerver<Add<R, "OPTIONS", P, {}>>;
+  options<P extends string, O extends RouteConfig>(
+    pattern: P,
+    config: O,
+    handler: HandlerFor<P, O>,
+  ): Swerver<Add<R, "OPTIONS", P, O>>;
+  options(pattern: string, a: unknown, b?: unknown): Swerver<any> {
+    return this.#register(pattern, "OPTIONS", a, b);
   }
 
   post<P extends string>(pattern: P, handler: HandlerFor<P, {}>): Swerver<Add<R, "POST", P, {}>>;
@@ -308,9 +523,16 @@ export class Swerver<R extends RouteTable = {}> {
    * Proxy a path prefix to a declared upstream (swerver handles it directly,
    * no TS crossing). `target` must be a reference from `upstream()`.
    */
-  proxy(prefix: string, target: UpstreamRef, opts?: Omit<Route, "path_prefix" | "upstream">): this {
+  proxy(prefix: string, target: UpstreamRef, opts?: ProxyOptions): this {
     if (this.#started) throw new Error("cannot add routes after start()");
     this.#proxyRoutes.push({ path_prefix: prefix, upstream: unbrand(target), ...opts });
+    return this;
+  }
+
+  /** Route a prefix to a per-request warm tenant microVM. */
+  tenant(prefix: string, tenant: TenantConfig, opts: ProxyOptions = {}): this {
+    if (this.#started) throw new Error("cannot add routes after start()");
+    this.#proxyRoutes.push({ path_prefix: prefix, ...opts, tenant });
     return this;
   }
 
@@ -383,71 +605,109 @@ export class Swerver<R extends RouteTable = {}> {
     validateResponses: boolean,
     parsed?: { pathname: string; query: string },
   ): Promise<Response> {
-    const path = parsed ? parsed.pathname : new URL(req.url).pathname;
-    const hit = match(ordered, path, req.method);
-    if (hit.kind === "none") return new Response("not found", { status: 404 });
-    if (hit.kind === "method") {
-      return new Response("method not allowed", {
-        status: 405,
-        headers: { allow: hit.allowed.join(", ") },
-      });
-    }
-    const route = hit.route;
+    const responseHeaders = new Headers();
     const ctx: AnyCtx = {
-      params: hit.params,
-      json: (data: unknown) => {
-        const res = Response.json(data);
+      params: {},
+      state: this.#state,
+      responseHeaders,
+      json: (data: unknown, init?: number | ResponseInit) => {
+        // Serialize exactly once. new Response(json, ...) with a default
+        // application/json content-type matches Response.json(data, init)
+        // semantics (an init content-type still wins), while letting the FFI
+        // direct-write path reuse RESPONSE_JSON instead of re-stringifying.
+        const json = JSON.stringify(data);
+        const res = new Response(json, mergeResponseInit(init, "application/json"));
         Reflect.set(res, RESPONSE_DATA, data);
+        Reflect.set(res, RESPONSE_JSON, json);
         return res;
       },
+      text: (body: string, init?: number | ResponseInit) =>
+        new Response(body, mergeResponseInit(init, "text/plain; charset=utf-8")),
+      html: (body: string, init?: number | ResponseInit) =>
+        new Response(body, mergeResponseInit(init, "text/html; charset=utf-8")),
+      redirect: (location: string, status = 302) =>
+        new Response(null, mergeResponseInit({ status, headers: { location } })),
+      header: (name: string, value: string) => responseHeaders.set(name, value),
+      cookie: (name: string, value: string, options?: CookieOptions) =>
+        responseHeaders.append("set-cookie", serializeCookie(name, value, options)),
     };
-    const { body, query, headers } = route.schemas;
-
-    if (body) {
-      let raw: unknown;
-      try {
-        raw = await req.json();
-      } catch {
-        return jsonError(400, "invalid JSON body");
-      }
-      const result = await runValidation(body, raw);
-      if (result.issues) return validationError(result.issues);
-      ctx.body = result.value;
-    }
-
-    if (query) {
-      const params = parsed ? new URLSearchParams(parsed.query) : new URL(req.url).searchParams;
-      const q = Object.fromEntries(params);
-      const result = await runValidation(query, q);
-      if (result.issues) return validationError(result.issues);
-      ctx.query = result.value;
-    }
-
-    if (headers) {
-      const h = Object.fromEntries(req.headers);
-      const result = await runValidation(headers, h);
-      if (result.issues) return validationError(result.issues);
-      ctx.headers = result.value;
-    }
-
-    let out: Response;
     try {
-      out = await route.handler(req, ctx);
-    } catch (err) {
-      console.error("swerverts handler error:", err);
-      return new Response("internal error", { status: 500 });
-    }
+      // Routing runs inside the try: match() calls decodeURIComponent on path
+      // params and the wildcard tail, which throws URIError on malformed
+      // percent-encoding (e.g. a lone '%'). Keeping it here routes that through
+      // #errorHandler instead of escaping the dispatcher as an unhandled throw.
+      const path = parsed ? parsed.pathname : new URL(req.url).pathname;
+      const hit = match(ordered, path, req.method);
+      if (hit.kind === "ok") ctx.params = hit.params;
 
-    const responseSchema = route.schemas.response;
-    if (validateResponses && responseSchema && Reflect.has(out, RESPONSE_DATA)) {
-      const data = Reflect.get(out, RESPONSE_DATA);
-      const result = await runValidation(responseSchema, data);
-      if (result.issues) {
-        console.error("swerverts response contract violation:", formatIssues(result.issues));
-        return jsonError(500, "response did not match its schema");
-      }
+      const terminal = async (): Promise<Response> => {
+        if (hit.kind === "none") return this.#notFoundHandler(req, ctx);
+        if (hit.kind === "method") return this.#methodNotAllowedHandler(req, hit.allowed, ctx);
+
+        const route = hit.route;
+        const { body, query, headers } = route.schemas;
+
+        if (body) {
+          let raw: unknown;
+          try {
+            raw = await req.json();
+          } catch {
+            return jsonError(400, "invalid JSON body");
+          }
+          const result = await runValidation(body, raw);
+          if (result.issues) return validationError(result.issues);
+          ctx.body = result.value;
+        }
+
+        if (query) {
+          const params = parsed ? new URLSearchParams(parsed.query) : new URL(req.url).searchParams;
+          const values: Record<string, string | string[]> = {};
+          for (const [key, value] of params) {
+            const previous = values[key];
+            values[key] = previous === undefined ? value : Array.isArray(previous) ? [...previous, value] : [previous, value];
+          }
+          const result = await runValidation(query, values);
+          if (result.issues) return validationError(result.issues);
+          ctx.query = result.value;
+        }
+
+        if (headers) {
+          const result = await runValidation(headers, Object.fromEntries(req.headers));
+          if (result.issues) return validationError(result.issues);
+          ctx.headers = result.value;
+        }
+
+        let response = await route.handler(req, ctx);
+        const responseSchema = route.schemas.responses?.[response.status] ?? route.schemas.response;
+        if (validateResponses && responseSchema && Reflect.has(response, RESPONSE_DATA)) {
+          const data = Reflect.get(response, RESPONSE_DATA);
+          const result = await runValidation(responseSchema, data);
+          if (result.issues) {
+            console.error("swerverts response contract violation:", formatIssues(result.issues));
+            response = jsonError(500, "response did not match its schema");
+          }
+        }
+        return response;
+      };
+
+      const routeMiddleware = hit.kind === "ok" ? (hit.route.schemas.middleware ?? []) : [];
+      const response = await runMiddleware(
+        [...this.#middleware, ...routeMiddleware],
+        req,
+        ctx,
+        terminal,
+      );
+      const decorated = applyResponseHeaders(response, responseHeaders);
+      return req.method === "HEAD"
+        ? new Response(null, { status: decorated.status, statusText: decorated.statusText, headers: decorated.headers })
+        : decorated;
+    } catch (error) {
+      const response = await this.#errorHandler(error, req, ctx);
+      const decorated = applyResponseHeaders(response, responseHeaders);
+      return req.method === "HEAD"
+        ? new Response(null, { status: decorated.status, statusText: decorated.statusText, headers: decorated.headers })
+        : decorated;
     }
-    return out;
   }
 
   /**
@@ -481,6 +741,7 @@ export class Swerver<R extends RouteTable = {}> {
   }
 
   async start(): Promise<RunningSwerver> {
+    if (this.#closed) throw new Error("cannot restart a stopped Swerver instance");
     if (this.#started) throw new Error("already started");
     this.#started = true;
     const port = this.#opts.port ?? 8080;
@@ -515,6 +776,27 @@ export class Swerver<R extends RouteTable = {}> {
           address: this.#opts.address,
           workers: this.#opts.workers ?? 1,
           staticRoot: this.#opts.staticRoot,
+          cacheStaticFiles: this.#opts.cacheStaticFiles,
+          disableMiddleware: this.#opts.disableMiddleware,
+          preencoded: this.#opts.preencoded,
+          maxConnections: this.#opts.maxConnections,
+          allowedHosts: this.#opts.allowedHosts,
+          listeners: this.#opts.listeners,
+          timeouts: this.#opts.timeouts,
+          limits: this.#opts.limits,
+          bufferPool: this.#opts.bufferPool,
+          tls: this.#opts.tls,
+          http2: this.#opts.http2,
+          quic: this.#opts.quic,
+          x402: this.#opts.x402,
+          admin: this.#opts.admin,
+          otel: this.#opts.otel,
+          postgres: this.#opts.postgres,
+          wasmFilters: this.#opts.wasmFilters,
+          wasmControlSocket: this.#opts.wasmControlSocket,
+          wasmControlConnections: this.#opts.wasmControlConnections,
+          wasmHostCallDeadlineMs: this.#opts.wasmHostCallDeadlineMs,
+          tenantIdleTtlMs: this.#opts.tenantIdleTtlMs,
           appSocket,
           appPrefixes: this.#prefixes(),
           upstreams: this.#upstreams,
@@ -581,89 +863,158 @@ export class Swerver<R extends RouteTable = {}> {
     validateResponses: boolean,
   ): Promise<RunningSwerver> {
     const lib = loadLib(resolveLib(this.#opts.libraryPath));
+    let handle = 0;
+    let nativeStarted = false;
+    let stopped = false;
 
-    // Config for the embedded server: no app upstream (dynamic routes are
-    // handled in-process via FFI, not proxied). Static and any raw upstreams/
-    // routes still pass through. workers is forced to 1 by libswerver.
-    const config = validateConfig(
-      generateConfig({
-        port,
-        address: this.#opts.address,
-        staticRoot: this.#opts.staticRoot,
-        appSocket: "",
-        appPrefixes: [],
-        upstreams: this.#upstreams,
-        routes: this.#proxyRoutes,
-        raw: this.#opts.raw,
-      }),
-    );
-    const cfgBytes = new TextEncoder().encode(JSON.stringify(config));
-    const handle = lib.init(ptr(cfgBytes), BigInt(cfgBytes.length));
-    if (handle === 0) throw new Error("swerver_init failed (see stderr)");
-    this.#ffiHandle = handle;
-
-    // Register each dynamic handler prefix as an FFI route.
-    this.#prefixes().forEach((prefix, i) => {
-      const pat = new TextEncoder().encode(prefix);
-      lib.route(handle, ptr(pat), BigInt(pat.length), i);
-    });
-
-    if (lib.start(handle) !== 0) throw new Error("swerver_start failed");
-
-    this.#ffiRunning = true;
-    void this.#ffiPump(lib, ordered, validateResponses);
-
-    // Reap the embedded server if the process exits without stop().
-    const onExit = () => {
-      if (this.#ffiHandle !== 0) lib.stop(this.#ffiHandle);
-    };
-    process.on("exit", onExit);
-    this.#cleanup = () => process.removeListener("exit", onExit);
-
-    await this.#waitForPort(port, this.#opts.readyTimeoutMs ?? 5000);
-
-    return {
-      port,
-      url: `http://${this.#opts.address ?? "localhost"}:${port}`,
-      stop: async () => {
-        this.#ffiRunning = false;
-        this.#cleanup?.();
-        await sleep(5); // let the pump observe running=false and settle
-        if (this.#ffiHandle !== 0) {
-          lib.stop(this.#ffiHandle);
-          this.#ffiHandle = 0;
-        }
-        lib.close();
-        this.#started = false;
-      },
-    };
-  }
-
-  async #ffiPump(
-    lib: Lib,
-    ordered: CompiledRoute<AnyHandler>[],
-    validateResponses: boolean,
-  ): Promise<void> {
-    // 6 u64 slots read as u32 lanes (no BigInt boxing). The reactor fills this
-    // via swerver_request; each #handleFfi reads it synchronously before any
-    // await, so a single shared slab is safe across fire-and-forget handlers.
-    const slabBuf = new ArrayBuffer(48);
-    const slab = new Uint32Array(slabBuf);
-    const slabPtr = ptr(slabBuf);
-    while (this.#ffiRunning) {
-      let handled = 0;
-      let reqId = lib.poll();
-      while (reqId !== 0n) {
-        void this.#handleFfi(lib, reqId, slab, slabPtr, ordered, validateResponses);
-        handled++;
-        reqId = lib.poll();
+    const closeWake = () => {
+      this.#wakeListener?.stop(true);
+      this.#wakeListener = undefined;
+      if (this.#wakePath) {
+        rmSync(this.#wakePath, { force: true });
+        this.#wakePath = undefined;
       }
-      // Under load, yield with sleep(0): the ~1ms timer coalesces a batch of
-      // parked requests into one drain pass, which is better for throughput
-      // than setImmediate's tight per-check-phase reschedule (measured ~10%
-      // higher rps, same p50). When idle, back off to a 1ms timer anyway so an
-      // idle server does not busy-spin — the loaded path never reaches it.
-      await sleep(handled > 0 ? 0 : 1);
+    };
+
+    try {
+      // Config for the embedded server: no app upstream (dynamic routes are
+      // handled in-process via FFI, not proxied). Static and any raw upstreams/
+      // routes still pass through. workers is forced to 1 by libswerver.
+      const config = validateConfig(
+        generateConfig({
+          port,
+          address: this.#opts.address,
+          staticRoot: this.#opts.staticRoot,
+          cacheStaticFiles: this.#opts.cacheStaticFiles,
+          disableMiddleware: this.#opts.disableMiddleware,
+          preencoded: this.#opts.preencoded,
+          maxConnections: this.#opts.maxConnections,
+          allowedHosts: this.#opts.allowedHosts,
+          listeners: this.#opts.listeners,
+          timeouts: this.#opts.timeouts,
+          limits: this.#opts.limits,
+          bufferPool: this.#opts.bufferPool,
+          tls: this.#opts.tls,
+          http2: this.#opts.http2,
+          quic: this.#opts.quic,
+          x402: this.#opts.x402,
+          admin: this.#opts.admin,
+          otel: this.#opts.otel,
+          postgres: this.#opts.postgres,
+          wasmFilters: this.#opts.wasmFilters,
+          wasmControlSocket: this.#opts.wasmControlSocket,
+          wasmControlConnections: this.#opts.wasmControlConnections,
+          wasmHostCallDeadlineMs: this.#opts.wasmHostCallDeadlineMs,
+          tenantIdleTtlMs: this.#opts.tenantIdleTtlMs,
+          appSocket: "",
+          appPrefixes: [],
+          upstreams: this.#upstreams,
+          routes: this.#proxyRoutes,
+          raw: this.#opts.raw,
+        }),
+      );
+      const cfgBytes = _ffiEncoder.encode(JSON.stringify(config));
+      handle = lib.init(ptr(cfgBytes), BigInt(cfgBytes.length));
+      if (handle === 0) throw new Error("swerver_init failed (see stderr)");
+      this.#ffiHandle = handle;
+
+      for (const [routeId, prefix] of this.#prefixes().entries()) {
+        const pattern = _ffiEncoder.encode(prefix);
+        if (lib.route(handle, ptr(pattern), BigInt(pattern.length), routeId) !== 0) {
+          throw new Error(`swerver_route failed for '${prefix}'`);
+        }
+      }
+
+      // Push wake: the reactor wakes Bun over a unix socket when a request
+      // parks. Request descriptors are copied out synchronously before each
+      // handler reaches its first await, so one shared slab is sufficient.
+      const slabBuffer = new ArrayBuffer(80);
+      const slab = new Uint32Array(slabBuffer);
+      const slabPtr = ptr(slabBuffer);
+      const track = (task: Promise<void>) => {
+        this.#ffiInFlight.add(task);
+        void task
+          .catch((error: unknown) => console.error("swerverts ffi dispatch error:", error))
+          .finally(() => this.#ffiInFlight.delete(task));
+      };
+      const drain = (): number => {
+        lib.wakeClear();
+        let count = 0;
+        let reqId = lib.poll();
+        while (reqId !== 0n) {
+          track(this.#handleFfi(lib, reqId, slab, slabPtr, ordered, validateResponses));
+          count += 1;
+          reqId = lib.poll();
+        }
+        return count;
+      };
+
+      this.#wakePath = join(
+        tmpdir(),
+        `swerverts-wake-${process.pid}-${Math.random().toString(36).slice(2)}.sock`,
+      );
+      rmSync(this.#wakePath, { force: true });
+      this.#wakeListener = Bun.listen({
+        unix: this.#wakePath,
+        socket: { open() {}, data: () => drain() },
+      });
+      const wakePathBytes = _ffiEncoder.encode(this.#wakePath);
+      if (lib.wakeConnect(handle, ptr(wakePathBytes), BigInt(wakePathBytes.length)) !== 0) {
+        throw new Error("swerver_wake_connect failed");
+      }
+
+      if (lib.start(handle) !== 0) throw new Error("swerver_start failed");
+      nativeStarted = true;
+
+      const onExit = () => {
+        if (this.#ffiHandle !== 0) lib.stop(this.#ffiHandle);
+      };
+      process.on("exit", onExit);
+      this.#cleanup = () => process.removeListener("exit", onExit);
+
+      await this.#waitForPort(port, this.#opts.readyTimeoutMs ?? 5000);
+
+      return {
+        port,
+        url: `http://${this.#opts.address ?? "localhost"}:${port}`,
+        stop: async () => {
+          if (stopped) return;
+          stopped = true;
+          this.#cleanup?.();
+
+          // Stop FFI route admission while keeping the reactor and bridge alive
+          // for handlers already executing in Bun.
+          if (this.#ffiHandle !== 0) lib.shutdown(this.#ffiHandle);
+          do {
+            drain();
+            if (this.#ffiInFlight.size > 0) {
+              await Promise.allSettled([...this.#ffiInFlight]);
+            } else if (lib.pending() > 0) {
+              await sleep(1);
+            }
+          } while (lib.pending() > 0 || this.#ffiInFlight.size > 0);
+
+          if (this.#ffiHandle !== 0) {
+            lib.stop(this.#ffiHandle);
+            this.#ffiHandle = 0;
+          }
+          closeWake();
+          lib.close();
+          this.#started = false;
+          this.#closed = true;
+        },
+      };
+    } catch (error) {
+      this.#cleanup?.();
+      if (handle !== 0) {
+        if (nativeStarted) lib.shutdown(handle);
+        lib.stop(handle);
+      }
+      this.#ffiHandle = 0;
+      closeWake();
+      lib.close();
+      this.#started = false;
+      throw error;
     }
   }
 
@@ -679,13 +1030,23 @@ export class Swerver<R extends RouteTable = {}> {
     // endian: each u64 is [low32, high32]; pointers fit in a JS number (48-bit
     // virtual addresses), lengths are u32.
     if (lib.request(reqId, slabPtr) !== 0) return;
+    if (lib.requestHeaders(reqId, slabPtr + 64) !== 0) return;
     const method = readSlice(slab[0]! + slab[1]! * 4294967296, slab[2]!);
     const rawPath = readSlice(slab[4]! + slab[5]! * 4294967296, slab[6]!);
+    const headersPtr = slab[16]! + slab[17]! * 4294967296;
+    const headersLen = slab[18]!;
     const bodyLen = slab[10]!;
+    // `body` is a view over the slot's native req_body (no copy). Safe only
+    // because the Request constructor below extracts the BufferSource
+    // synchronously, before the first await, while the slot is still parked; the
+    // bytes are never read after the slot is freed. Do not defer this read.
     const body =
       bodyLen > 0
-        ? new Uint8Array(toArrayBuffer(slab[8]! + slab[9]! * 4294967296, 0, bodyLen).slice(0))
+        ? new Uint8Array(toArrayBuffer(slab[8]! + slab[9]! * 4294967296, 0, bodyLen))
         : undefined;
+    // The slot's response buffer: JSON responses are serialized straight into it.
+    const respPtr = slab[12]! + slab[13]! * 4294967296;
+    const respCap = slab[14]!;
 
     // Split the path into pathname + query once, so #dispatch does not re-parse
     // the URL it would otherwise rebuild from req.url.
@@ -693,25 +1054,83 @@ export class Swerver<R extends RouteTable = {}> {
     const pathname = qi < 0 ? rawPath : rawPath.slice(0, qi);
     const query = qi < 0 ? "" : rawPath.slice(qi + 1);
 
-    let status = 500;
-    let ctype = "text/plain";
-    let out: Uint8Array = _ffiInternalError;
     try {
-      const init: RequestInit = { method };
+      // Decode request headers inside the try: readPackedHeaders can throw (a
+      // header value Headers.append rejects, or a malformed packed block).
+      // Outside the try that throw would leave the slot parked forever (never
+      // answered, never freed) instead of returning a 500. It still runs before
+      // the first await, so the shared slab is consumed before drain reuses it.
+      const headers = readPackedHeaders(headersPtr, headersLen);
+      const init: RequestInit = { method, headers };
       if (body !== undefined && method !== "GET" && method !== "HEAD") init.body = body;
       const req = new Request(`http://ffi.local${rawPath}`, init);
       const res = await this.#dispatch(req, ordered, validateResponses, { pathname, query });
-      status = res.status;
-      ctype = res.headers.get("content-type") ?? "";
-      out = new Uint8Array(await res.arrayBuffer());
+      const status = res.status;
+      const responseHeaders = encodeFfiResponseHeaders(res.headers);
+
+      // Direct-write fast path: a ctx.json response already serialized its body
+      // (RESPONSE_JSON), so copy those bytes straight into the slot's response
+      // buffer (a writable view) and answer in place - no second JSON.stringify,
+      // no res.arrayBuffer() copy, no respond() body copy.
+      if (Reflect.has(res, RESPONSE_JSON)) {
+        const json = Reflect.get(res, RESPONSE_JSON) as string;
+        const view = new Uint8Array(toArrayBuffer(respPtr, 0, respCap));
+        const { read, written } = _ffiEncoder.encodeInto(json, view);
+        if (read === json.length) {
+          const result = responseHeaders.packed
+            ? lib.respondInplaceFull(
+                reqId,
+                status,
+                ptrOrEmpty(responseHeaders.packed),
+                responseHeaders.packed.length,
+                written,
+              )
+            : lib.respondInplace(
+                reqId,
+                status,
+                ptrOrEmpty(responseHeaders.contentType),
+                responseHeaders.contentType.length,
+                written,
+              );
+          finishFfiResponse(lib, reqId, result);
+          return;
+        }
+        // Overflowed the slot buffer; fall through to the copy path.
+      }
+      const out = new Uint8Array(await res.arrayBuffer());
+      const result = responseHeaders.packed
+        ? lib.respondFull(
+            reqId,
+            status,
+            ptrOrEmpty(responseHeaders.packed),
+            responseHeaders.packed.length,
+            ptrOrEmpty(out),
+            out.length,
+          )
+        : lib.respond(
+            reqId,
+            status,
+            ptrOrEmpty(responseHeaders.contentType),
+            responseHeaders.contentType.length,
+            ptrOrEmpty(out),
+            out.length,
+          );
+      finishFfiResponse(lib, reqId, result);
     } catch (err) {
       console.error("swerverts ffi handler error:", err);
-      status = 500;
-      ctype = "text/plain";
-      out = _ffiInternalError;
+      const ct = _ffiEncoder.encode("text/plain");
+      const result = lib.respond(
+        reqId,
+        500,
+        ptr(ct),
+        ct.length,
+        ptr(_ffiInternalError),
+        _ffiInternalError.length,
+      );
+      if (result !== 0 && result !== -1) {
+        console.error(`swerverts ffi fallback response failed: ${result}`);
+      }
     }
-    const ct = _ffiEncoder.encode(ctype);
-    lib.respond(reqId, status, ptr(ct), ct.length, ptr(out), out.length);
   }
 
   async #waitForPort(port: number, timeoutMs: number): Promise<void> {
@@ -745,10 +1164,17 @@ export class Swerver<R extends RouteTable = {}> {
   /** Stop swerver and the app server, and clean up the temp socket/config. */
   async #doStop(): Promise<void> {
     this.#cleanup?.();
-    this.#child?.kill();
     this.#app?.stop(true);
     if (this.#child) {
-      await Promise.race([this.#child.exited, sleep(2000)]);
+      this.#child.kill();
+      const exited = await Promise.race([
+        this.#child.exited.then(() => true),
+        sleep(2000).then(() => false),
+      ]);
+      if (!exited) {
+        this.#child.kill("SIGKILL");
+        await this.#child.exited;
+      }
     }
     if (this.#tmpDir) {
       try {
@@ -758,20 +1184,147 @@ export class Swerver<R extends RouteTable = {}> {
       }
     }
     this.#started = false;
+    this.#closed = true;
   }
 }
 
 const _ffiDecoder = new TextDecoder();
 const _ffiEncoder = new TextEncoder();
 const _ffiInternalError = _ffiEncoder.encode("internal error");
+const _ffiResponseTooLarge = _ffiEncoder.encode("response too large");
+// Bun's ptr() throws on a zero-length view, so an empty body/content-type is
+// passed as this 1-byte buffer's pointer with length 0.
+const _ffiScratch = new Uint8Array(1);
+const _ffiScratchPtr = ptr(_ffiScratch);
+const ptrOrEmpty = (buf: Uint8Array): number => (buf.length > 0 ? ptr(buf) : _ffiScratchPtr);
+function finishFfiResponse(lib: Lib, reqId: bigint, result: number): void {
+  if (result === 0 || result === -1) return;
+  if (result === -2) {
+    const contentType = _ffiEncoder.encode("text/plain");
+    const fallback = lib.respond(
+      reqId,
+      500,
+      ptr(contentType),
+      contentType.length,
+      ptr(_ffiResponseTooLarge),
+      _ffiResponseTooLarge.length,
+    );
+    if (fallback === 0 || fallback === -1) return;
+    throw new Error(`swerver fallback response failed (${fallback})`);
+  }
+  throw new Error(`swerver response failed (${result})`);
+}
 /** Decode a UTF-8 slice given a pointer and length (both from the FFI slab). */
 function readSlice(p: number, len: number): string {
   if (len === 0) return "";
   return _ffiDecoder.decode(toArrayBuffer(p, 0, len));
 }
 
+function readPackedHeaders(p: number, len: number): Headers {
+  const headers = new Headers();
+  if (len === 0) return headers;
+  const bytes = new Uint8Array(toArrayBuffer(p, 0, len));
+  let offset = 0;
+  while (offset < bytes.length) {
+    const nameEnd = bytes.indexOf(0, offset);
+    if (nameEnd <= offset) throw new Error("invalid packed request headers");
+    const name = _ffiDecoder.decode(bytes.subarray(offset, nameEnd));
+    offset = nameEnd + 1;
+    const valueEnd = bytes.indexOf(0, offset);
+    if (valueEnd < offset) throw new Error("invalid packed request headers");
+    headers.append(name, _ffiDecoder.decode(bytes.subarray(offset, valueEnd)));
+    offset = valueEnd + 1;
+  }
+  return headers;
+}
+
+const _ffiManagedResponseHeaders = new Set([
+  "alt-svc",
+  "connection",
+  "content-length",
+  "date",
+  "keep-alive",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+]);
+
+type FfiResponseHeaders =
+  | { contentType: Uint8Array; packed?: never }
+  | { contentType?: never; packed: Uint8Array };
+
+function encodeFfiResponseHeaders(headers: Headers): FfiResponseHeaders {
+  const entries: Array<readonly [string, string]> = [];
+  headers.forEach((value, name) => {
+    const normalized = name.toLowerCase();
+    if (!_ffiManagedResponseHeaders.has(normalized) && normalized !== "set-cookie") {
+      entries.push([normalized, value]);
+    }
+  });
+  const getSetCookie = (headers as Headers & { getSetCookie?: () => string[] }).getSetCookie;
+  if (getSetCookie) {
+    for (const value of getSetCookie.call(headers)) entries.push(["set-cookie", value]);
+  } else {
+    const value = headers.get("set-cookie");
+    if (value !== null) entries.push(["set-cookie", value]);
+  }
+
+  if (entries.length === 0 || (entries.length === 1 && entries[0]![0] === "content-type")) {
+    return { contentType: _ffiEncoder.encode(entries[0]?.[1] ?? "") };
+  }
+
+  let block = "";
+  for (const [name, value] of entries) block += `${name}\0${value}\0`;
+  return { packed: _ffiEncoder.encode(block) };
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+function joinRoutePath(base: string, path: string): string {
+  const left = base.endsWith("/") ? base.slice(0, -1) : base;
+  const right = path.startsWith("/") ? path : `/${path}`;
+  return `${left}${right}` || "/";
+}
+
+function mergeResponseInit(
+  init: number | ResponseInit | undefined,
+  defaultContentType?: string,
+): ResponseInit {
+  const base = responseInit(init);
+  const headers = new Headers(base.headers);
+  if (defaultContentType && !headers.has("content-type")) headers.set("content-type", defaultContentType);
+  return { ...base, headers };
+}
+
+function applyResponseHeaders(response: Response, pending: Headers): Response {
+  if ([...pending].length === 0) return response;
+  try {
+    copyHeaders(pending, response.headers);
+    return response;
+  } catch {
+    const headers = new Headers(response.headers);
+    copyHeaders(pending, headers);
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    });
+  }
+}
+
+function copyHeaders(source: Headers, target: Headers): void {
+  for (const [name, value] of source) {
+    if (name !== "set-cookie") target.set(name, value);
+  }
+  const getSetCookie = (source as Headers & { getSetCookie?: () => string[] }).getSetCookie;
+  if (getSetCookie) {
+    for (const value of getSetCookie.call(source)) target.append("set-cookie", value);
+  } else {
+    const value = source.get("set-cookie");
+    if (value !== null) target.append("set-cookie", value);
+  }
 }
 
 function jsonError(status: number, message: string): Response {
@@ -813,6 +1366,34 @@ function swaggerHtml(title: string, openapiUrl: string): string {
 
 export { generateConfig, validateConfig, ConfigError } from "./config.ts";
 export type { SwerverConfig, Upstream, Route, UpstreamRef, ValidatedConfig } from "./config.ts";
+export type {
+  AdminConfig,
+  AuthConfig,
+  BufferPoolConfig,
+  CacheConfig,
+  ConnectionPool,
+  ConsulDiscovery,
+  DnsDiscovery,
+  HealthCheck,
+  Http2Config,
+  ListenerConfig,
+  LoadBalancer,
+  OtelConfig,
+  PostgresConfig,
+  ProxyOptions,
+  QuicConfig,
+  RateLimitConfig,
+  RetryConfig,
+  ServerConfig,
+  TenantConfig,
+  TlsConfig,
+  TimeoutsConfig,
+  TrafficTarget,
+  WasmFilterConfig,
+  X402Config,
+  X402RouteConfig,
+  LimitsConfig,
+} from "./config.ts";
 export type { Brand } from "./brand.ts";
 export type { ParamsOf, ParamNames } from "./router.ts";
 export type { Schema, InferInput, InferOutput } from "./schema.ts";
@@ -821,3 +1402,13 @@ export type { Client, ClientResponse } from "./client.ts";
 export { buildOpenApi } from "./openapi.ts";
 export type { OpenApiDocument, OpenApiOptions } from "./openapi.ts";
 export type { FetchLike } from "./client.ts";
+export type {
+  CookieOptions,
+  ErrorHandler,
+  MethodNotAllowedHandler,
+  Middleware,
+  MiddlewareContext,
+  Next,
+  NotFoundHandler,
+  ResponseHelpers,
+} from "./framework.ts";

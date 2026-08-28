@@ -45,6 +45,8 @@ type Verb<R extends RouteTable, M extends string> = <P extends PathsOf<R, M> & s
 
 export interface Client<R extends RouteTable> {
   get: Verb<R, "GET">;
+  head: Verb<R, "HEAD">;
+  options: Verb<R, "OPTIONS">;
   post: Verb<R, "POST">;
   put: Verb<R, "PUT">;
   patch: Verb<R, "PATCH">;
@@ -101,6 +103,8 @@ export function createClient<R extends RouteTable>(
   const base = baseUrl.replace(/\/$/, "");
   return {
     get: makeVerb(base, "GET", fetchImpl),
+    head: makeVerb(base, "HEAD", fetchImpl),
+    options: makeVerb(base, "OPTIONS", fetchImpl),
     post: makeVerb(base, "POST", fetchImpl),
     put: makeVerb(base, "PUT", fetchImpl),
     patch: makeVerb(base, "PATCH", fetchImpl),
