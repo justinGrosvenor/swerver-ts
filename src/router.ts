@@ -27,6 +27,8 @@ export type ParamsOf<P extends string> = { [K in ParamNames<P>]: string };
 /** Runtime params are a plain string map; the typed view narrows the keys. */
 export type Params = Record<string, string>;
 
+import type { StandardSchemaV1 } from "./schema.ts";
+
 export interface CompiledRoute<H> {
   pattern: string;
   regex: RegExp;
@@ -35,6 +37,9 @@ export interface CompiledRoute<H> {
   // Optional HTTP method constraint (set by app.get/post/...). Undefined means
   // the route matches any method.
   method?: string;
+  // Optional request-body schema; when present the dispatcher validates the
+  // JSON body before calling the handler.
+  schema?: StandardSchemaV1;
   // The static leading path, up to the first ":" or "*". This is what swerver
   // matches on as a route path_prefix.
   prefix: string;
@@ -49,7 +54,12 @@ function literalPrefix(pattern: string): string {
   return slash <= 0 ? "/" : head.slice(0, slash + 1);
 }
 
-export function compile<H>(pattern: string, handler: H, method?: string): CompiledRoute<H> {
+export function compile<H>(
+  pattern: string,
+  handler: H,
+  method?: string,
+  schema?: StandardSchemaV1,
+): CompiledRoute<H> {
   const paramNames: string[] = [];
   const source = pattern
     .split("/")
@@ -68,6 +78,7 @@ export function compile<H>(pattern: string, handler: H, method?: string): Compil
     paramNames,
     handler,
     method,
+    schema,
     prefix: literalPrefix(pattern),
   };
 }

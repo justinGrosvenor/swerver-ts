@@ -76,6 +76,33 @@ app.get("/files/*", (_req, { params }) => new Response(params.rest));
 and a path that matches with the wrong method returns `405` with an `Allow`
 header.
 
+### Typed, validated request bodies
+
+Pass `{ body: schema }` to `route`/`post`/`put`/`patch`. `schema` is any
+[Standard Schema](https://standardschema.dev) (Zod, Valibot, ArkType, ...), so
+there is no library lock-in. The body is parsed and validated before your
+handler runs: `ctx.body` is the schema's output type, an invalid body returns
+`422` with the failing issues, and a non-JSON body returns `400`.
+
+```ts
+import { z } from "zod";
+
+const CreateUser = z.object({ name: z.string(), age: z.number().int().min(0) });
+
+app.post("/users/:id", { body: CreateUser }, (_req, { params, body }) => {
+  params.id;   // string  (from the pattern)
+  body.name;   // string  (from the schema)
+  body.age;    // number
+  return Response.json({ id: params.id, ...body });
+});
+```
+
+A rejected body responds with:
+
+```json
+{ "error": "validation failed", "issues": [ { "message": "...", "path": "age" } ] }
+```
+
 ### Typed upstreams
 
 `upstream()` returns an unforgeable reference. `proxy()` accepts only that
@@ -154,7 +181,9 @@ routes, so static proxying and dynamic TS handlers coexist.
 
 Register a dynamic route. `handler` is `(req: Request, ctx: { params }) =>
 Response | Promise<Response>`, and `ctx.params` is typed from the pattern.
-`route` matches any method; the verb methods constrain it.
+`route` matches any method; the verb methods constrain it. Pass
+`{ body: schema }` before the handler on `route`/`post`/`put`/`patch` to
+validate the JSON body and get a typed `ctx.body`.
 
 ### `app.upstream(name, def)` / `app.proxy(prefix, ref, opts?)`
 

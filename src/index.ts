@@ -35,6 +35,11 @@ import {
   type Params,
   type ParamsOf,
 } from "./router.ts";
+import {
+  formatIssues,
+  runValidation,
+  type StandardSchemaV1,
+} from "./schema.ts";
 
 /** Handler context. `params` keys are inferred from the route pattern. */
 export type Ctx<P extends string = string> = { params: ParamsOf<P> };
@@ -43,8 +48,25 @@ export type Handler<P extends string = string> = (
   ctx: Ctx<P>,
 ) => Response | Promise<Response>;
 
+/** Options for a route with a validated body. `body` is any Standard Schema. */
+export interface RouteOptions<S extends StandardSchemaV1> {
+  body: S;
+}
+
+/** Handler context when a body schema is set; `body` is the validated output. */
+export type BodyCtx<P extends string, B> = { params: ParamsOf<P>; body: B };
+export type BodyHandler<P extends string, B> = (
+  req: Request,
+  ctx: BodyCtx<P, B>,
+) => Response | Promise<Response>;
+
+type Infer<S extends StandardSchemaV1> = StandardSchemaV1.InferOutput<S>;
+
 // Internal, param-erased handler shape for storage and dispatch.
-type AnyHandler = (req: Request, ctx: { params: Params }) => Response | Promise<Response>;
+type AnyHandler = (
+  req: Request,
+  ctx: { params: Params; body?: unknown },
+) => Response | Promise<Response>;
 
 const METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] as const;
 export type Method = (typeof METHODS)[number];
@@ -109,30 +131,68 @@ export class Swerver {
   /**
    * Register a dynamic route for any method. Patterns support ":param" and a
    * trailing "*"; the handler's `ctx.params` keys are inferred from the pattern.
+   * Pass `{ body: schema }` (any Standard Schema) to validate and type the JSON
+   * body: `ctx.body` is the schema's output, and an invalid body returns 422.
    */
-  route<P extends string>(pattern: P, handler: Handler<P>): this {
-    return this.#add(pattern, handler as AnyHandler, undefined);
+  route<P extends string>(pattern: P, handler: Handler<P>): this;
+  route<P extends string, S extends StandardSchemaV1>(
+    pattern: P,
+    opts: RouteOptions<S>,
+    handler: BodyHandler<P, Infer<S>>,
+  ): this;
+  route(pattern: string, a: unknown, b?: unknown): this {
+    return this.#register(pattern, undefined, a, b);
   }
 
   get<P extends string>(pattern: P, handler: Handler<P>): this {
     return this.#add(pattern, handler as AnyHandler, "GET");
   }
-  post<P extends string>(pattern: P, handler: Handler<P>): this {
-    return this.#add(pattern, handler as AnyHandler, "POST");
-  }
-  put<P extends string>(pattern: P, handler: Handler<P>): this {
-    return this.#add(pattern, handler as AnyHandler, "PUT");
-  }
-  patch<P extends string>(pattern: P, handler: Handler<P>): this {
-    return this.#add(pattern, handler as AnyHandler, "PATCH");
-  }
   delete<P extends string>(pattern: P, handler: Handler<P>): this {
     return this.#add(pattern, handler as AnyHandler, "DELETE");
   }
 
-  #add(pattern: string, handler: AnyHandler, method?: string): this {
+  post<P extends string>(pattern: P, handler: Handler<P>): this;
+  post<P extends string, S extends StandardSchemaV1>(
+    pattern: P,
+    opts: RouteOptions<S>,
+    handler: BodyHandler<P, Infer<S>>,
+  ): this;
+  post(pattern: string, a: unknown, b?: unknown): this {
+    return this.#register(pattern, "POST", a, b);
+  }
+
+  put<P extends string>(pattern: P, handler: Handler<P>): this;
+  put<P extends string, S extends StandardSchemaV1>(
+    pattern: P,
+    opts: RouteOptions<S>,
+    handler: BodyHandler<P, Infer<S>>,
+  ): this;
+  put(pattern: string, a: unknown, b?: unknown): this {
+    return this.#register(pattern, "PUT", a, b);
+  }
+
+  patch<P extends string>(pattern: P, handler: Handler<P>): this;
+  patch<P extends string, S extends StandardSchemaV1>(
+    pattern: P,
+    opts: RouteOptions<S>,
+    handler: BodyHandler<P, Infer<S>>,
+  ): this;
+  patch(pattern: string, a: unknown, b?: unknown): this {
+    return this.#register(pattern, "PATCH", a, b);
+  }
+
+  // Resolve the (opts, handler) vs (handler) overload and register the route.
+  #register(pattern: string, method: string | undefined, a: unknown, b: unknown): this {
+    if (typeof a === "function") {
+      return this.#add(pattern, a as AnyHandler, method);
+    }
+    const schema = (a as RouteOptions<StandardSchemaV1>).body;
+    return this.#add(pattern, b as AnyHandler, method, schema);
+  }
+
+  #add(pattern: string, handler: AnyHandler, method?: string, schema?: StandardSchemaV1): this {
     if (this.#started) throw new Error("cannot add routes after start()");
-    this.#routes.push(compile(pattern, handler, method));
+    this.#routes.push(compile(pattern, handler, method, schema));
     return this;
   }
 
@@ -186,8 +246,26 @@ export class Swerver {
               headers: { allow: hit.allowed.join(", ") },
             });
           }
+          const route = hit.route;
+          const ctx: { params: Params; body?: unknown } = { params: hit.params };
+          if (route.schema) {
+            let raw: unknown;
+            try {
+              raw = await req.json();
+            } catch {
+              return jsonError(400, "invalid JSON body");
+            }
+            const result = await runValidation(route.schema, raw);
+            if (result.issues) {
+              return new Response(
+                JSON.stringify({ error: "validation failed", issues: formatIssues(result.issues) }),
+                { status: 422, headers: { "content-type": "application/json" } },
+              );
+            }
+            ctx.body = result.value;
+          }
           try {
-            return await hit.route.handler(req, { params: hit.params });
+            return await route.handler(req, ctx);
           } catch (err) {
             console.error("swerverts handler error:", err);
             return new Response("internal error", { status: 500 });
@@ -318,7 +396,15 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+function jsonError(status: number, message: string): Response {
+  return new Response(JSON.stringify({ error: message }), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+}
+
 export { generateConfig, validateConfig, ConfigError } from "./config.ts";
 export type { SwerverConfig, Upstream, Route, UpstreamRef, ValidatedConfig } from "./config.ts";
 export type { Brand } from "./brand.ts";
 export type { ParamsOf, ParamNames } from "./router.ts";
+export type { StandardSchemaV1 } from "./schema.ts";

@@ -81,3 +81,32 @@ const raw = { server: { port: 8080 } };
 spawnFromValidated(raw);
 
 spawnFromValidated(validateConfig(raw)); // ok: validateConfig mints the brand
+
+// ── Typed request bodies via Standard Schema (tested with Zod) ───────────────
+import { z } from "zod";
+
+const CreateUser = z.object({ name: z.string(), age: z.number() });
+
+app.post("/users/:id", { body: CreateUser }, (_req, ctx) => {
+  const id: string = ctx.params.id; // params still typed from the pattern
+  const name: string = ctx.body.name; // body typed from the schema output
+  const age: number = ctx.body.age;
+  void id;
+  void name;
+  void age;
+  // @ts-expect-error - "email" is not on the schema
+  ctx.body.email;
+  return new Response("ok");
+});
+
+app.post("/plain", (_req, ctx) => {
+  // @ts-expect-error - no schema means no ctx.body
+  ctx.body;
+  return new Response("ok");
+});
+
+// @ts-expect-error - number is not assignable to the inferred body { name; age }
+app.post("/users/:id", { body: CreateUser }, (_req, ctx: { params: { id: string }; body: number }) => {
+  void ctx;
+  return new Response("no");
+});
