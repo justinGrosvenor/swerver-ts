@@ -611,10 +611,11 @@ export class Swerver<R extends RouteTable = {}> {
       state: this.#state,
       responseHeaders,
       json: (data: unknown, init?: number | ResponseInit) => {
-        // Serialize exactly once. new Response(json, ...) with a default
-        // application/json content-type matches Response.json(data, init)
-        // semantics (an init content-type still wins), while letting the FFI
-        // direct-write path reuse RESPONSE_JSON instead of re-stringifying.
+        // Serialize exactly once. new Response(json, ...) with the same default
+        // content-type Bun's Response.json emits (application/json;charset=utf-8)
+        // matches Response.json(data, init) semantics (an init content-type still
+        // wins), while letting the FFI direct-write path reuse RESPONSE_JSON
+        // instead of re-stringifying.
         const json = JSON.stringify(data);
         if (json === undefined) {
           // undefined, a function, or a symbol: not JSON-serializable.
@@ -622,7 +623,7 @@ export class Swerver<R extends RouteTable = {}> {
           // sending an empty body (and tagging RESPONSE_JSON as undefined).
           throw new TypeError("ctx.json: value is not JSON-serializable");
         }
-        const res = new Response(json, mergeResponseInit(init, "application/json"));
+        const res = new Response(json, mergeResponseInit(init, "application/json;charset=utf-8"));
         Reflect.set(res, RESPONSE_DATA, data);
         Reflect.set(res, RESPONSE_JSON, json);
         return res;
