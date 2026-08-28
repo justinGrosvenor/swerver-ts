@@ -59,8 +59,24 @@ export interface Lib {
 }
 
 /**
- * Locate libswerver: explicit path, then SWERVER_LIB, then a `lib/` sibling of
- * the SWERVER_BIN directory (dev layout: zig-out/bin + zig-out/lib).
+ * The prebuilt platform package for this host, if installed: @swerver/<os>-<arch>
+ * ships libswerver (and the binary) as an optionalDependency, so npm/bun install
+ * only the one matching the host. Mirrors the resolution in binary.ts.
+ */
+function platformPackageLib(libName: string): string | null {
+  try {
+    const resolved = require.resolve(`@swerver/${process.platform}-${process.arch}/${libName}`);
+    if (existsSync(resolved)) return resolved;
+  } catch {
+    // Not installed for this host; fall through.
+  }
+  return null;
+}
+
+/**
+ * Locate libswerver: explicit path, then SWERVER_LIB, then the @swerver/<os>-<arch>
+ * prebuilt package, then a `lib/` sibling of SWERVER_BIN (dev layout:
+ * zig-out/bin + zig-out/lib).
  */
 export function resolveLib(explicit?: string): string {
   const name = process.platform === "darwin" ? "libswerver.dylib" : "libswerver.so";
@@ -73,12 +89,17 @@ export function resolveLib(explicit?: string): string {
     if (!existsSync(fromEnv)) throw new Error(`SWERVER_LIB points at a missing file: ${fromEnv}`);
     return fromEnv;
   }
+  const fromPkg = platformPackageLib(name);
+  if (fromPkg) return fromPkg;
   const bin = process.env["SWERVER_BIN"];
   if (bin) {
     const candidate = join(dirname(dirname(bin)), "lib", name);
     if (existsSync(candidate)) return candidate;
   }
-  throw new Error("libswerver not found. Set SWERVER_LIB, pass libraryPath, or set SWERVER_BIN.");
+  throw new Error(
+    `libswerver not found. Install the @swerver/${process.platform}-${process.arch} prebuilt, ` +
+      `set SWERVER_LIB, pass libraryPath, or set SWERVER_BIN.`,
+  );
 }
 
 const T = FFIType;

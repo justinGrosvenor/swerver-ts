@@ -30,14 +30,23 @@ client ──▶ swerver (TLS, H2/H3, static, proxy, policy)
 
 ## Install
 
-Requires [Bun](https://bun.sh) >= 1.2. The socket backend needs the swerver
-binary (`SWERVER_BIN` or `binaryPath`); the FFI backend needs `libswerver`
-(`SWERVER_LIB` or `libraryPath`). swerverts has no required runtime npm
-dependencies.
+Requires [Bun](https://bun.sh) >= 1.2.
 
 ```sh
 bun add swerverts
 ```
+
+swerverts needs the swerver engine: the binary for the socket backend,
+`libswerver` for the FFI backend. It locates them in this order:
+
+1. an explicit `binaryPath` / `libraryPath` passed to `new Swerver({ ... })`
+2. the `SWERVER_BIN` / `SWERVER_LIB` environment variables
+3. a prebuilt `@swerver/<os>-<arch>` package, installed automatically as an
+   optionalDependency for the host platform (esbuild/@swc style)
+
+A published prebuilt makes `bun add swerverts` runnable with no extra setup. For
+local development against a source checkout, point `SWERVER_BIN` / `SWERVER_LIB`
+at the engine's `zig-out/bin` / `zig-out/lib`.
 
 ## Usage
 
