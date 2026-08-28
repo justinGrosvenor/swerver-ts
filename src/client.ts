@@ -18,13 +18,14 @@ type Lookup<R extends RouteTable, M extends string, P extends string> = `${M} ${
   ? R[`${M} ${P}`]
   : never;
 
-// Only the argument groups a route actually needs (params/body/query),
+// Only the argument groups a route actually needs (params/body/query/headers),
 // each omitted when empty/undefined.
 type CallArgs<E extends RouteEntry> = ([keyof E["params"]] extends [never]
   ? {}
   : { params: E["params"] }) &
   ([E["body"]] extends [undefined] ? {} : { body: E["body"] }) &
-  ([E["query"]] extends [undefined] ? {} : { query: E["query"] });
+  ([E["query"]] extends [undefined] ? {} : { query: E["query"] }) &
+  ([E["headers"]] extends [undefined] ? {} : { headers: E["headers"] });
 
 type HasKeys<T> = [keyof T] extends [never] ? false : true;
 
@@ -53,6 +54,7 @@ export interface Client<R extends RouteTable> {
 interface RuntimeArgs {
   params?: Record<string, string>;
   query?: Record<string, unknown>;
+  headers?: Record<string, string>;
   body?: unknown;
 }
 
@@ -77,11 +79,13 @@ function makeVerb(baseUrl: string, method: string) {
       const s = qs.toString();
       if (s) url += `?${s}`;
     }
+    const headers: Record<string, string> = { ...args.headers };
     const init: RequestInit = { method };
     if (args.body !== undefined) {
       init.body = JSON.stringify(args.body);
-      init.headers = { "content-type": "application/json" };
+      headers["content-type"] = "application/json";
     }
+    if (Object.keys(headers).length > 0) init.headers = headers;
     return fetch(url, init);
   };
 }

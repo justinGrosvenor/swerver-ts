@@ -128,9 +128,45 @@ const client = api.client("http://localhost:8080");
 const res = await client.post("/users", { body: { name: "grace", age: 30 } });
 const user = await res.json(); // typed: { id: string; name: string }
 
-client.get("/users/:id", { params: { id: "7" } }); // params required and typed
-client.get("/nope");                                // compile error: unknown route
-client.post("/users", { body: { name: 12 } });      // compile error: wrong body
+client.get("/users/:id", { params: { id: "7" } });          // params required and typed
+client.get("/me", { headers: { authorization: "Bearer x" } }); // headers required and typed
+client.get("/nope");                                        // compile error: unknown route
+client.post("/users", { body: { name: 12 } });              // compile error: wrong body
+```
+
+The call args (`params`, `body`, `query`, `headers`) are each required only when
+the route declares them, and typed from its schemas.
+
+### OpenAPI
+
+`app.openapi(options?)` builds an OpenAPI 3.1 document from the registered
+routes. Path params come from the pattern; request/response bodies and
+query/header params come from the route schemas. Because there is no standard
+Schema-to-JSON-Schema conversion, pass your library's converter as
+`toJsonSchema` (Zod v4 ships `z.toJSONSchema`); without it the structure is
+still emitted with open body schemas.
+
+```ts
+import { z } from "zod";
+
+const doc = app.openapi({
+  info: { title: "Users API", version: "1.0.0" },
+  servers: [{ url: "http://localhost:8080" }],
+  toJsonSchema: (schema) => z.toJSONSchema(schema),
+});
+// doc.paths["/users/{id}"].get.parameters -> [{ name: "id", in: "path", ... }]
+// doc.paths["/users"].post.responses -> { "200": ..., "400": ..., "422": ... }
+```
+
+### Response validation in development
+
+Set `validateResponses: true` to validate every `ctx.json(...)` against the
+route's `response` schema and return `500` on a mismatch (with the issues
+logged). It catches handlers that violate their own declared contract. Leave it
+off in production; the typed `ctx.json` already gives you compile-time safety.
+
+```ts
+const app = new Swerver({ port: 8080, validateResponses: true });
 ```
 
 ### Strict TypeScript
@@ -215,6 +251,7 @@ routes, so static proxying and dynamic TS handlers coexist.
 | `raw` | none | extra config merged over the generated one |
 | `binaryPath` | resolved | explicit path to the swerver binary |
 | `readyTimeoutMs` | `5000` | how long `start()` waits for the port |
+| `validateResponses` | `false` | validate `ctx.json` against the response schema, 500 on mismatch |
 
 ### `app.route(pattern, handler)` and `app.get/post/put/patch/delete`
 
@@ -229,6 +266,12 @@ validate the JSON body and get a typed `ctx.body`.
 Declare a swerver upstream and proxy a path prefix to it. `upstream` returns an
 `UpstreamRef` that `proxy` requires, so upstream references are checked at
 compile time. `def` is an upstream minus its `name` (servers, `tls`, ...).
+
+### `app.client(baseUrl?)` / `app.openapi(options?)`
+
+`client` returns a typed fetch client for the registered routes (chain the
+route calls so the table accumulates). `openapi` returns an OpenAPI 3.1
+document; pass `toJsonSchema` to convert your schemas.
 
 ### `app.start()` returns a `RunningSwerver`
 

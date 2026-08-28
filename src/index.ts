@@ -28,6 +28,7 @@ import {
   type ValidatedConfig,
 } from "./config.ts";
 import { createClient, type Client } from "./client.ts";
+import { buildOpenApi, type OpenApiDocument, type OpenApiOptions } from "./openapi.ts";
 import {
   compile,
   match,
@@ -93,6 +94,7 @@ export interface RouteEntry {
   params: Record<string, string>;
   body: unknown;
   query: unknown;
+  headers: unknown;
   response: unknown;
 }
 export type RouteTable = Record<string, RouteEntry>;
@@ -102,6 +104,7 @@ export type EntryFor<P extends string, O extends RouteConfig> = {
   params: ParamsOf<P>;
   body: O extends { body: Schema } ? InputAt<O, "body"> : undefined;
   query: O extends { query: Schema } ? InputAt<O, "query"> : undefined;
+  headers: O extends { headers: Schema } ? InputAt<O, "headers"> : undefined;
   response: O extends { response: Schema } ? OutputAt<O, "response"> : unknown;
 };
 
@@ -152,7 +155,17 @@ export interface SwerverOptions {
   binaryPath?: string;
   /** Milliseconds to wait for the front port to accept connections. Default 5000. */
   readyTimeoutMs?: number;
+  /**
+   * Validate every `ctx.json(...)` against the route's response schema and
+   * return 500 on a mismatch. Off by default; turn on in development to catch
+   * handlers that violate their own declared response contract.
+   */
+  validateResponses?: boolean;
 }
+
+// ctx.json tags its Response with the pre-serialization data so the dispatcher
+// can validate it against the response schema when validateResponses is on.
+const RESPONSE_DATA = Symbol("swerverts.responseData");
 
 // Bun's global is untyped from plain TS; declare the sliver we use.
 declare const Bun: {
@@ -297,11 +310,23 @@ export class Swerver<R extends RouteTable = {}> {
     return createClient<R>(base);
   }
 
+  /**
+   * Build an OpenAPI 3.1 document from the registered routes. Path params come
+   * from the pattern; bodies and query/header params come from the route
+   * schemas, converted to JSON Schema by `options.toJsonSchema` (e.g. Zod v4's
+   * `z.toJSONSchema`). Without a converter the structure is still emitted with
+   * open body schemas. Any-method `route()` routes are omitted.
+   */
+  openapi(options: OpenApiOptions = {}): OpenApiDocument {
+    return buildOpenApi(this.#routes, options);
+  }
+
   async start(): Promise<RunningSwerver> {
     if (this.#started) throw new Error("already started");
     this.#started = true;
     const port = this.#opts.port ?? 8080;
     const ordered = sortBySpecificity(this.#routes);
+    const validateResponses = this.#opts.validateResponses ?? false;
 
     this.#tmpDir = mkdtempSync(join(tmpdir(), "swerverts-"));
     const appSocket = join(this.#tmpDir, "app.sock");
@@ -324,7 +349,11 @@ export class Swerver<R extends RouteTable = {}> {
           const route = hit.route;
           const ctx: AnyCtx = {
             params: hit.params,
-            json: (data: unknown) => Response.json(data),
+            json: (data: unknown) => {
+              const res = Response.json(data);
+              Reflect.set(res, RESPONSE_DATA, data);
+              return res;
+            },
           };
           const { body, query, headers } = route.schemas;
 
@@ -354,12 +383,27 @@ export class Swerver<R extends RouteTable = {}> {
             ctx.headers = result.value;
           }
 
+          let out: Response;
           try {
-            return await route.handler(req, ctx);
+            out = await route.handler(req, ctx);
           } catch (err) {
             console.error("swerverts handler error:", err);
             return new Response("internal error", { status: 500 });
           }
+
+          const responseSchema = route.schemas.response;
+          if (validateResponses && responseSchema && Reflect.has(out, RESPONSE_DATA)) {
+            const data = Reflect.get(out, RESPONSE_DATA);
+            const result = await runValidation(responseSchema, data);
+            if (result.issues) {
+              console.error(
+                "swerverts response contract violation:",
+                formatIssues(result.issues),
+              );
+              return jsonError(500, "response did not match its schema");
+            }
+          }
+          return out;
         },
       });
     }
@@ -507,3 +551,5 @@ export type { ParamsOf, ParamNames } from "./router.ts";
 export type { Schema, InferInput, InferOutput } from "./schema.ts";
 export { createClient } from "./client.ts";
 export type { Client, ClientResponse } from "./client.ts";
+export { buildOpenApi } from "./openapi.ts";
+export type { OpenApiDocument, OpenApiOptions } from "./openapi.ts";

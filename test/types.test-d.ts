@@ -95,6 +95,9 @@ const api = new Swerver()
   .get("/users/:id", { response: UserOut }, (_r, ctx) => ctx.json({ id: ctx.params.id, name: "x" }))
   .post("/users", { body: CreateUser, response: UserOut }, (_r, ctx) =>
     ctx.json({ id: "1", name: ctx.body.name }),
+  )
+  .get("/me", { headers: AuthHeaders, response: UserOut }, (_r, ctx) =>
+    ctx.json({ id: "1", name: ctx.headers.authorization }),
   );
 
 const client = api.client("http://localhost:8080");
@@ -110,6 +113,9 @@ async function clientUse() {
   const id2: string = u2.id;
   void id2;
 
+  // Header-typed client call
+  await client.get("/me", { headers: { authorization: "Bearer x" } });
+
   // @ts-expect-error - unknown path is not in the route table
   await client.get("/nope");
   // @ts-expect-error - missing required params
@@ -118,5 +124,10 @@ async function clientUse() {
   await client.post("/users", { body: { name: 123 } });
   // @ts-expect-error - GET /users was never registered (only POST)
   await client.get("/users");
+  // @ts-expect-error - missing required headers
+  await client.get("/me");
 }
 void clientUse;
+
+// ── OpenAPI document ────────────────────────────────────────────────────────
+export type OpenApiChecks = [Expect<Equal<ReturnType<typeof api.openapi>, Record<string, unknown>>>];
