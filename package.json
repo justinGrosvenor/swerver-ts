@@ -24,7 +24,12 @@
   "engines": {
     "bun": ">=1.2.0"
   },
-  "optionalDependencies": {},
+  "optionalDependencies": {
+    "@swerver/darwin-arm64": "0.1.0-alpha.31",
+    "@swerver/darwin-x64": "0.1.0-alpha.31",
+    "@swerver/linux-arm64": "0.1.0-alpha.31",
+    "@swerver/linux-x64": "0.1.0-alpha.31"
+  },
   "devDependencies": {
     "@types/node": "^26.4.0",
     "typescript": "^7.0.2",
