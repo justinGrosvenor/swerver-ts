@@ -25,10 +25,9 @@
     "bun": ">=1.2.0"
   },
   "optionalDependencies": {
-    "@swerver/darwin-arm64": "0.1.0-alpha.32",
-    "@swerver/darwin-x64": "0.1.0-alpha.32",
-    "@swerver/linux-arm64": "0.1.0-alpha.32",
-    "@swerver/linux-x64": "0.1.0-alpha.32"
+    "@swerver/darwin-arm64": "0.1.0-alpha.33",
+    "@swerver/linux-arm64": "0.1.0-alpha.33",
+    "@swerver/linux-x64": "0.1.0-alpha.33"
   },
   "devDependencies": {
     "@types/node": "^26.4.0",
