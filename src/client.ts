@@ -45,6 +45,8 @@ type Verb<R extends RouteTable, M extends string> = <P extends PathsOf<R, M> & s
 
 export interface Client<R extends RouteTable> {
   get: Verb<R, "GET">;
+  head: Verb<R, "HEAD">;
+  options: Verb<R, "OPTIONS">;
   post: Verb<R, "POST">;
   put: Verb<R, "PUT">;
   patch: Verb<R, "PATCH">;
@@ -78,7 +80,14 @@ function makeVerb(baseUrl: string, method: string, fetchImpl: FetchLike) {
     if (args.query) {
       const qs = new URLSearchParams();
       for (const [key, value] of Object.entries(args.query)) {
-        if (value !== undefined) qs.set(key, String(value));
+        if (value === undefined) continue;
+        // Emit repeated keys for arrays (tag=a&tag=b) to match the server's
+        // array-aware query parsing; String(array) would comma-join instead.
+        if (Array.isArray(value)) {
+          for (const item of value) if (item !== undefined) qs.append(key, String(item));
+        } else {
+          qs.set(key, String(value));
+        }
       }
       const s = qs.toString();
       if (s) url += `?${s}`;
@@ -101,6 +110,8 @@ export function createClient<R extends RouteTable>(
   const base = baseUrl.replace(/\/$/, "");
   return {
     get: makeVerb(base, "GET", fetchImpl),
+    head: makeVerb(base, "HEAD", fetchImpl),
+    options: makeVerb(base, "OPTIONS", fetchImpl),
     post: makeVerb(base, "POST", fetchImpl),
     put: makeVerb(base, "PUT", fetchImpl),
     patch: makeVerb(base, "PATCH", fetchImpl),

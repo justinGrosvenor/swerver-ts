@@ -10,27 +10,43 @@ filters) as the front process, and write your dynamic routes in TypeScript.
 
 ## How it works
 
-swerver runs as the front-facing server. Your TypeScript handlers run in a Bun
-HTTP server on a unix socket, and swerver proxies to it as an ordinary
-upstream. Only the routes you declare in TS pay the crossing; static files,
-proxied routes, and every gateway feature stay on swerver's own paths.
+swerver always owns the front-facing socket. Dynamic TypeScript routes can run
+through either backend:
+
+- `ffi` embeds `libswerver` in the Bun process and exchanges requests through
+  bounded native slots. This is the low-latency, high-throughput path.
+- `socket` runs the Bun app on a unix socket and lets swerver proxy to it. This
+  is the portable fallback and the better fit for payloads beyond FFI limits.
+
+Static files, native proxy routes, TLS, HTTP/2, HTTP/3, auth, rate limits, x402,
+WASM filters, and observability stay on native swerver paths in both modes.
 
 ```
-client ──▶ swerver (Bun-free hot paths: TLS, H2, H3, static, proxy)
-              │ matched dynamic route
-              ▼
-           Bun app server on a unix socket ──▶ your handler
+client ──▶ swerver (TLS, H2/H3, static, proxy, policy)
+              │ matched TypeScript route
+              ├── FFI slot ────────────────▶ Bun handler
+              └── unix-socket proxy ───────▶ Bun handler
 ```
 
 ## Install
 
-Requires [Bun](https://bun.sh) >= 1.2 and the swerver binary. Point swerverts
-at the binary with `SWERVER_BIN`, or install a `@swerver/<platform>` package,
-or put `swerver` on your `PATH`.
+Requires [Bun](https://bun.sh) >= 1.2.
 
 ```sh
 bun add swerverts
 ```
+
+swerverts needs the swerver engine: the binary for the socket backend,
+`libswerver` for the FFI backend. It locates them in this order:
+
+1. an explicit `binaryPath` / `libraryPath` passed to `new Swerver({ ... })`
+2. the `SWERVER_BIN` / `SWERVER_LIB` environment variables
+3. a prebuilt `@swerver/<os>-<arch>` package, installed automatically as an
+   optionalDependency for the host platform (esbuild/@swc style)
+
+A published prebuilt makes `bun add swerverts` runnable with no extra setup. For
+local development against a source checkout, point `SWERVER_BIN` / `SWERVER_LIB`
+at the engine's `zig-out/bin` / `zig-out/lib`.
 
 ## Usage
 
@@ -39,20 +55,60 @@ import { Swerver } from "swerverts";
 
 const app = new Swerver({
   port: 8080,
+  backend: "ffi",
   staticRoot: "./public", // served by swerver, not TS
 });
 
 // params is typed from the pattern: { name: string } here.
-app.get("/hello/:name", (_req, { params }) =>
-  Response.json({ hi: params.name }),
-);
+// Return a plain value: objects become JSON, strings become text. params is
+// typed from the pattern ({ name: string } here).
+app.get("/hello/:name", (_req, { params }) => ({ hi: params.name }));
 
-app.post("/echo", async (req) => {
-  const body = await req.text();
-  return new Response(body, { headers: { "content-type": "text/plain" } });
-});
+app.post("/echo", async (req) => (await req.text()) || "(empty)");
 
 await app.start();
+```
+
+### Responses and errors
+
+A handler can return a value and swerverts builds the response: objects and
+arrays become JSON, strings become `text/plain`, `undefined` is `204`, and a
+`Response` (or `ctx.json(...)` / `ctx.text(...)`) is used as-is when you need to
+set a status or headers. When a route declares a `response` schema, the returned
+value is type-checked against it and validated at runtime.
+
+For a controlled error status, throw or return an `HttpError` via `error()`. Its
+body is JSON for objects and text for strings, and it skips the error handler.
+
+```ts
+import { Swerver, error } from "swerverts";
+
+const app = new Swerver().get("/users/:id", (_req, { params }) => {
+  const user = db.get(params.id);
+  if (!user) throw error(404, "user not found");
+  return user; // -> 200 application/json
+});
+```
+
+### Middleware and response helpers
+
+Global and per-route middleware use onion ordering. The context includes
+`json`, `text`, `html`, `redirect`, `header`, `cookie`, and shared `state`
+helpers. Custom error, not-found, and method-not-allowed handlers use the same
+context.
+
+```ts
+const app = new Swerver({ state: { service: "users" } })
+  .use(async (_request, ctx, next) => {
+    const response = await next();
+    ctx.header("x-service", String(ctx.state.service));
+    return response;
+  })
+  .onError((error, _request, ctx) => ctx.json({ error: String(error) }, 500))
+  .get("/hello", { middleware: [auth] }, (_request, ctx) => {
+    ctx.cookie("session", "abc", { httpOnly: true, secure: true });
+    return ctx.text("hello");
+  });
 ```
 
 ### Typed route params
@@ -72,7 +128,7 @@ app.get("/users/:id/posts/:postId", (_req, { params }) => {
 app.get("/files/*", (_req, { params }) => new Response(params.rest));
 ```
 
-`route()` matches any method; `get`/`post`/`put`/`patch`/`delete` constrain it,
+`route()` matches any method; the verb registrars constrain it,
 and a path that matches with the wrong method returns `405` with an `Allow`
 header.
 
@@ -86,6 +142,7 @@ Pass a config object before the handler on `route`/`post`/`put`/`patch` (and
 - `query` - URL query params; `ctx.query` is its output type
 - `headers` - request headers (lower-cased); `ctx.headers` is its output type
 - `response` - types `ctx.json(...)` so you cannot return the wrong shape
+- `responses` - maps status codes to distinct response schemas
 
 ```ts
 import { z } from "zod";
@@ -110,6 +167,19 @@ body returns `400`:
 
 ```json
 { "error": "validation failed", "issues": [ { "message": "...", "path": "age" } ] }
+```
+
+For multi-status routes, the status and payload are checked together:
+
+```ts
+app.get(
+  "/users/:id",
+  { responses: { 200: UserOut, 404: ErrorOut } },
+  (_request, ctx) =>
+    ctx.params.id === "missing"
+      ? ctx.json({ error: "not found" }, 404)
+      : ctx.json({ id: ctx.params.id, name: "Ada" }, 200),
+);
 ```
 
 ### Typed client
@@ -251,32 +321,75 @@ app.route("/api/*", (req) => api.fetch(req));
 - `/users/:id` named param, available as `ctx.params.id`
 - `/files/*` trailing wildcard, available as `ctx.params.rest`
 
-Each pattern's static leading prefix is registered with swerver as a proxy
-route; swerver forwards matching requests to the app server, which does the
-fine-grained matching.
+`HEAD` and `OPTIONS` have first-class registrars and typed-client methods.
+`HEAD` automatically falls back to `GET`; `Allow` includes `HEAD` whenever a
+`GET` route exists. Prefix groups can accumulate into the typed client:
+
+```ts
+const api = new Swerver().group("/api", (group) =>
+  group.get("/users/:id", handler).post("/users", createHandler),
+);
+
+api.client().get("/api/users/:id", { params: { id: "7" } });
+```
+
+Each pattern's static leading prefix is registered with swerver. Matching
+requests enter either the FFI bridge or the Bun unix-socket upstream; the TS
+router then performs fine-grained method and parameter matching.
 
 ### Full gateway config
 
-Anything swerverts does not model is passed straight through with `raw`, using
-swerver's [JSON config schema](https://github.com/justingrosvenor/swerver/blob/main/docs/reference/config-schema.md):
+The parsed swerver schema is typed directly: listeners, TLS, HTTP/2, QUIC,
+timeouts, limits, buffer pools, admin, OTEL, global x402, Postgres, WASM/Nether,
+upstream discovery and pools, auth, cache, retries, traffic splitting,
+mirroring, route x402, and tenant routing. `raw` remains an escape hatch for a
+new native field that lands before this package updates.
 
 ```ts
 const app = new Swerver({
   port: 8443,
-  raw: {
-    server: { tls: { cert: "./cert.pem", key: "./key.pem" }, http3: true },
-    upstreams: [
-      { name: "bedrock", servers: [{ address: "bedrock-runtime.us-east-1.amazonaws.com", port: 443 }], tls: true },
-    ],
-    routes: [
-      { path_prefix: "/models/", upstream: "bedrock", rate_limit: { rps: 50 } },
-    ],
-  },
+  tls: { cert_path: "./cert.pem", key_path: "./key.pem" },
+  quic: { enabled: true, cert_path: "./cert.pem", key_path: "./key.pem" },
+  bufferPool: { buffer_count: 8192 },
+  otel: { enabled: true, collector_url: "https://otel.example/v1/traces" },
+});
+
+const bedrock = app.upstream("bedrock", {
+  servers: [{ address: "bedrock-runtime.us-east-1.amazonaws.com", port: 443 }],
+  tls: true,
+  health_check: { path: "/health", interval_ms: 5000 },
+});
+app.proxy("/models/", bedrock, {
+  rate_limit: { requests_per_second: 50, burst_size: 100 },
+  retry: { max_retries: 2 },
+});
+
+app.tenant("/tenants/", {
+  socket_dir: "/run/nether/tenants",
+  header: "x-tenant-id",
 });
 ```
 
 `raw` upstreams and routes are concatenated with the generated app upstream and
 routes, so static proxying and dynamic TS handlers coexist.
+
+## Performance snapshot
+
+Current local HTTP/1.1 development results (requests/second; per-core figure
+after the dot) put the FFI backend ahead of Express and Fastify in each shown
+scenario. These are tuning snapshots, not portable guarantees; rerun on the
+target host and workload.
+
+| scenario | Express | Fastify | Bun | swerverts FFI |
+| --- | ---: | ---: | ---: | ---: |
+| pipeline | 70,976 · 67k/core | 86,004 · 83k/core | 231,352 · 229k/core | 101,535 · 85k/core |
+| baseline | 66,810 · 66k/core | 83,633 · 83k/core | 198,052 · 196k/core | 90,440 · 74k/core |
+| JSON | 47,026 · 41k/core | 62,659 · 61k/core | 112,166 · 111k/core | 59,105 · 47k/core |
+| static | 32,728 · 15k/core | 27,325 · 14k/core | 55,398 · 54k/core | 42,321 · 36k/core |
+
+The FFI JSON helper serializes directly into the native response slot. The
+content-type-only path stays minimal, while arbitrary request/response headers
+and repeated `Set-Cookie` values use the full ABI path.
 
 ## API
 
@@ -288,24 +401,28 @@ routes, so static proxying and dynamic TS handlers coexist.
 | `address` | swerver default | front bind address |
 | `workers` | `1` | swerver worker processes |
 | `staticRoot` | none | directory served as static files |
+| `backend` | `socket` | `socket` or in-process `ffi` |
+| `libraryPath` | resolved | explicit `libswerver` path for FFI |
+| `state` | `{}` | mutable state exposed as `ctx.state` |
 | `raw` | none | extra config merged over the generated one |
 | `binaryPath` | resolved | explicit path to the swerver binary |
 | `readyTimeoutMs` | `5000` | how long `start()` waits for the port |
 | `validateResponses` | `false` | validate `ctx.json` against the response schema, 500 on mismatch |
 
-### `app.route(pattern, handler)` and `app.get/post/put/patch/delete`
+### `app.route(pattern, handler)` and verb methods
 
 Register a dynamic route. `handler` is `(req: Request, ctx: { params }) =>
 Response | Promise<Response>`, and `ctx.params` is typed from the pattern.
-`route` matches any method; the verb methods constrain it. Pass
-`{ body: schema }` before the handler on `route`/`post`/`put`/`patch` to
+`route` matches any method; `get/post/put/patch/delete/head/options` constrain
+it. Pass `{ body: schema }` before the handler on any registrar to
 validate the JSON body and get a typed `ctx.body`.
 
-### `app.upstream(name, def)` / `app.proxy(prefix, ref, opts?)`
+### `app.upstream(name, def)` / `app.proxy(...)` / `app.tenant(...)`
 
 Declare a swerver upstream and proxy a path prefix to it. `upstream` returns an
 `UpstreamRef` that `proxy` requires, so upstream references are checked at
 compile time. `def` is an upstream minus its `name` (servers, `tls`, ...).
+`tenant` creates a Nether tenant-as-upstream route without a static upstream.
 
 ### `app.client(baseUrl?)` / `app.openapi(options?)` / `app.docs(options?)`
 
@@ -322,8 +439,8 @@ backed by in-process dispatch. Both for tests.
 
 ### `app.start()` returns a `RunningSwerver`
 
-`start()` validates the config, launches the app server, spawns swerver, and
-resolves once the front port accepts connections. It returns a running handle:
+`start()` validates the config, starts the selected backend, and resolves once
+the front port accepts connections. It returns a running handle:
 
 ```ts
 const server = await app.start();
@@ -334,14 +451,30 @@ await server.stop();
 
 The handle has no `route`/`upstream`/`proxy` methods, so adding routes after
 start is a compile error, not just a runtime throw. The swerver child is reaped
-automatically if the process exits without `stop()`.
+automatically if the process exits without `stop()`. A `Swerver` instance is
+one-shot; create a new instance after stopping instead of restarting it.
+
+For FFI, `stop()` first closes host-route admission, drains every admitted JS
+handler and native slot, then tears down the reactor and bridge storage. New
+host-route requests receive `503` during that drain rather than being stranded.
+
+### Backend limits
+
+The FFI backend uses 256 bounded request slots, a 32 KiB request-body slot, and
+40 KiB request/response header blocks. Response capacity is bounded by both the
+128 KiB native slot and the configured native buffer's safe single-copy size
+(about 63.5 KiB with defaults). Oversize requests fail with `413`; oversize
+responses fail closed with `500`. Use the socket backend for larger bodies or
+when process isolation matters. The FFI backend embeds one native
+server/reactor per process.
 
 ### Config validation
 
 `start()` runs `validateConfig()` before spawning swerver and throws a
-`ConfigError` (listing every problem) if the config is invalid: a bad port, an
-upstream with no servers, a duplicate upstream name, `tls` on a unix-socket
-server, or a route that references an upstream you never declared. Nothing is
+`ConfigError` (listing every problem) if the config is invalid: bad ports,
+certificate mismatches, invalid Postgres/WASM pool sizes, duplicate upstreams,
+illegal tenant combinations, `tls` on a unix-socket server, or undeclared
+primary/split/mirror upstreams. Nothing is
 spawned when validation fails. `validateConfig` is also exported for use in
 tests or CI; it returns a `ValidatedConfig`, the only type the spawn path
 accepts.

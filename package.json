@@ -16,14 +16,19 @@
   "scripts": {
     "example": "bun run examples/hello.ts",
     "typecheck": "tsc --noEmit",
-    "test": "tsc --noEmit"
+    "test": "bun test && tsc --noEmit",
+    "test:ffi": "bun test test/ffi.test.ts"
   },
   "keywords": ["swerver", "gateway", "http", "proxy", "bun"],
   "license": "MIT",
   "engines": {
     "bun": ">=1.2.0"
   },
-  "optionalDependencies": {},
+  "optionalDependencies": {
+    "@swerver/darwin-arm64": "0.1.0-alpha.33",
+    "@swerver/linux-arm64": "0.1.0-alpha.33",
+    "@swerver/linux-x64": "0.1.0-alpha.33"
+  },
   "devDependencies": {
     "@types/node": "^26.4.0",
     "typescript": "^7.0.2",
