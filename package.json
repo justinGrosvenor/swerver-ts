@@ -1,6 +1,6 @@
 {
   "name": "swerverts",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Run the swerver gateway with TypeScript route handlers.",
   "type": "module",
   "module": "src/index.ts",
@@ -25,9 +25,9 @@
     "bun": ">=1.2.0"
   },
   "optionalDependencies": {
-    "@swerver/darwin-arm64": "0.1.0-alpha.33",
-    "@swerver/linux-arm64": "0.1.0-alpha.33",
-    "@swerver/linux-x64": "0.1.0-alpha.33"
+    "@swerver/darwin-arm64": "0.1.0-alpha.34",
+    "@swerver/linux-arm64": "0.1.0-alpha.34",
+    "@swerver/linux-x64": "0.1.0-alpha.34"
   },
   "devDependencies": {
     "@types/node": "^26.4.0",
