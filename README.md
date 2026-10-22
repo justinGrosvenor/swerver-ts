@@ -30,7 +30,7 @@ client ──▶ swerver (TLS, H2/H3, static, proxy, policy)
 
 ## Install
 
-Requires [Bun](https://bun.sh) >= 1.2.
+Requires [Bun](https://bun.sh) >= 1.4.4 (includes the CVE-2026-111497 Brotli security fix).
 
 ```sh
 bun add swerverts
