@@ -1,6 +1,6 @@
 {
   "name": "swerverts",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Run the swerver gateway with TypeScript route handlers.",
   "type": "module",
   "module": "src/index.ts",
@@ -22,7 +22,7 @@
   "keywords": ["swerver", "gateway", "http", "proxy", "bun"],
   "license": "MIT",
   "engines": {
-    "bun": ">=1.2.0"
+    "bun": ">=1.4.4"
   },
   "optionalDependencies": {
     "@swerver/darwin-arm64": "0.1.0-alpha.34",
