@@ -1,5 +1,5 @@
 // Standard Schema (https://standardschema.dev) is a tiny interface that Zod,
-// Valibot, ArkType and others implement, so swerverts can accept any of them
+// Valibot, ArkType and others implement, so swerver-ts can accept any of them
 // for validation without depending on a specific library.
 //
 // `Schema` here is a deliberately loose structural bound: its `validate`

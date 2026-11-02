@@ -1,4 +1,4 @@
-// swerverts: run the swerver gateway with TypeScript route handlers.
+// swerver-ts: run the swerver gateway with TypeScript route handlers.
 //
 // swerver (TLS, HTTP/1.1/2/3, static, reverse proxy, rate limiting, auth,
 // x402, WASM filters, nether microVM upstreams) runs as the front process.
@@ -6,7 +6,7 @@
 // socket, which swerver proxies to as an ordinary upstream. Only routes you
 // claim pay the crossing; everything else stays on swerver's zero-copy paths.
 //
-//   import { Swerver } from "swerverts";
+//   import { Swerver } from "swerver-ts";
 //
 //   const app = new Swerver({ port: 8080, staticRoot: "./public" });
 //   app.route("/hello/:name", (req, { params }) =>
@@ -263,10 +263,10 @@ export interface SwerverOptions {
 
 // ctx.json tags its Response with the pre-serialization data so the dispatcher
 // can validate it against the response schema when validateResponses is on.
-const RESPONSE_DATA = Symbol("swerverts.responseData");
+const RESPONSE_DATA = Symbol("swerver-ts.responseData");
 // ...and with the JSON string it already serialized, so the FFI direct-write
 // path can copy those bytes into the slot instead of stringifying a second time.
-const RESPONSE_JSON = Symbol("swerverts.responseJson");
+const RESPONSE_JSON = Symbol("swerver-ts.responseJson");
 
 /** Options for `app.docs()`: OpenAPI options plus where to mount the pages. */
 export interface DocsOptions extends OpenApiOptions {
@@ -383,7 +383,7 @@ export class Swerver<R extends RouteTable = {}> {
   #state: Record<string, unknown>;
   #middleware: Middleware[] = [];
   #errorHandler: ErrorHandler = (error) => {
-    console.error("swerverts handler error:", error);
+    console.error("swerver-ts handler error:", error);
     return new Response("internal error", { status: 500 });
   };
   #notFoundHandler: NotFoundHandler = () => new Response("not found", { status: 404 });
@@ -595,7 +595,7 @@ export class Swerver<R extends RouteTable = {}> {
   docs(options: DocsOptions = {}): this {
     const path = options.path ?? "/docs";
     const openapiPath = options.openapiPath ?? "/openapi.json";
-    const title = options.info?.title ?? "swerverts API";
+    const title = options.info?.title ?? "swerver-ts API";
     const openapiOptions: OpenApiOptions = {
       ...(options.info ? { info: options.info } : {}),
       ...(options.servers ? { servers: options.servers } : {}),
@@ -712,7 +712,7 @@ export class Swerver<R extends RouteTable = {}> {
           const data = Reflect.get(response, RESPONSE_DATA);
           const result = await runValidation(responseSchema, data);
           if (result.issues) {
-            console.error("swerverts response contract violation:", formatIssues(result.issues));
+            console.error("swerver-ts response contract violation:", formatIssues(result.issues));
             response = jsonError(500, "response did not match its schema");
           }
         }
@@ -797,7 +797,7 @@ export class Swerver<R extends RouteTable = {}> {
       return running;
     }
 
-    this.#tmpDir = mkdtempSync(join(tmpdir(), "swerverts-"));
+    this.#tmpDir = mkdtempSync(join(tmpdir(), "swerver-ts-"));
     const appSocket = join(this.#tmpDir, "app.sock");
     const configPath = join(this.#tmpDir, "config.json");
 
@@ -914,7 +914,7 @@ export class Swerver<R extends RouteTable = {}> {
     // traffic and the rest idle. Fork-per-core distribution needs Linux.
     if (process.platform === "darwin") {
       console.warn(
-        `swerverts: ${workers} FFI workers requested, but macOS does not distribute ` +
+        `swerver-ts: ${workers} FFI workers requested, but macOS does not distribute ` +
           `connections across a SO_REUSEPORT group - one worker will serve nearly all ` +
           `traffic. Run on Linux for real multi-core scaling.`,
       );
@@ -1074,7 +1074,7 @@ export class Swerver<R extends RouteTable = {}> {
       const track = (task: Promise<void>) => {
         this.#ffiInFlight.add(task);
         void task
-          .catch((error: unknown) => console.error("swerverts ffi dispatch error:", error))
+          .catch((error: unknown) => console.error("swerver-ts ffi dispatch error:", error))
           .finally(() => this.#ffiInFlight.delete(task));
       };
       const drain = (): number => {
@@ -1091,7 +1091,7 @@ export class Swerver<R extends RouteTable = {}> {
 
       this.#wakePath = join(
         tmpdir(),
-        `swerverts-wake-${process.pid}-${Math.random().toString(36).slice(2)}.sock`,
+        `swerver-ts-wake-${process.pid}-${Math.random().toString(36).slice(2)}.sock`,
       );
       rmSync(this.#wakePath, { force: true });
       this.#wakeListener = Bun.listen({
@@ -1261,7 +1261,7 @@ export class Swerver<R extends RouteTable = {}> {
           );
       finishFfiResponse(lib, reqId, result);
     } catch (err) {
-      console.error("swerverts ffi handler error:", err);
+      console.error("swerver-ts ffi handler error:", err);
       const ct = _ffiEncoder.encode("text/plain");
       const result = lib.respond(
         reqId,
@@ -1272,7 +1272,7 @@ export class Swerver<R extends RouteTable = {}> {
         _ffiInternalError.length,
       );
       if (result !== 0 && result !== -1) {
-        console.error(`swerverts ffi fallback response failed: ${result}`);
+        console.error(`swerver-ts ffi fallback response failed: ${result}`);
       }
     }
   }

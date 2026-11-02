@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "swerverts",
+      "name": "swerver-ts",
       "devDependencies": {
         "@types/node": "^26.4.0",
         "typescript": "^7.0.2",

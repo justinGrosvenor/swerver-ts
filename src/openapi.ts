@@ -125,7 +125,7 @@ export function buildOpenApi(
   return {
     openapi: "3.1.0",
     info: {
-      title: options.info?.title ?? "swerverts API",
+      title: options.info?.title ?? "swerver-ts API",
       version: options.info?.version ?? "0.0.0",
       ...(options.info?.description ? { description: options.info.description } : {}),
     },

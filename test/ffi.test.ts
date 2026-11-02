@@ -12,7 +12,7 @@ describe("FFI backend", () => {
     });
     const app = new Swerver({ backend: "ffi", port })
       .get("/headers", (request, ctx) => {
-        ctx.header("x-powered-by", "swerverts");
+        ctx.header("x-powered-by", "swerver-ts");
         ctx.cookie("a", "1", { httpOnly: true });
         ctx.cookie("b", "2", { sameSite: "Lax" });
         return ctx.json({ requestId: request.headers.get("x-request-id") });
@@ -31,7 +31,7 @@ describe("FFI backend", () => {
       });
       expect(headers.status).toBe(200);
       expect(await headers.json()).toEqual({ requestId: "roundtrip" });
-      expect(headers.headers.get("x-powered-by")).toBe("swerverts");
+      expect(headers.headers.get("x-powered-by")).toBe("swerver-ts");
       expect(headers.headers.getSetCookie()).toEqual([
         "a=1; HttpOnly",
         "b=2; SameSite=Lax",

@@ -1,4 +1,4 @@
-// Typed view of the subset of swerver's JSON config that swerverts emits, plus
+// Typed view of the subset of swerver's JSON config that swerver-ts emits, plus
 // the generator that turns a Swerver app into a config the binary accepts.
 //
 // The full schema lives in the swerver repo (docs/reference/config-schema.md).
@@ -323,7 +323,7 @@ export interface SwerverConfig {
   [key: string]: unknown;
 }
 
-export const APP_UPSTREAM = "__swerverts_app";
+export const APP_UPSTREAM = "__swerver_ts_app";
 
 export interface GenerateInput {
   port: number;
@@ -359,7 +359,7 @@ export interface GenerateInput {
   upstreams?: Upstream[] | undefined;
   routes?: Route[] | undefined;
   // Merged over the generated config; wins on conflicts. Use for tls, and
-  // anything else swerverts does not model.
+  // anything else swerver-ts does not model.
   raw?: Partial<SwerverConfig> | undefined;
 }
 

@@ -1,10 +1,10 @@
-# swerverts
+# swerver-ts
 
 Run the [swerver](https://github.com/justingrosvenor/swerver) gateway with
 TypeScript route handlers.
 
 swerver is a high-performance HTTP/1.1 + HTTP/2 + HTTP/3 server and API gateway
-written in Zig. swerverts lets you keep all of that (TLS, HTTP/2, HTTP/3/QUIC,
+written in Zig. swerver-ts lets you keep all of that (TLS, HTTP/2, HTTP/3/QUIC,
 static file serving, reverse proxy, rate limiting, auth, x402 payments, WASM
 filters) as the front process, and write your dynamic routes in TypeScript.
 
@@ -33,10 +33,10 @@ client ──▶ swerver (TLS, H2/H3, static, proxy, policy)
 Requires [Bun](https://bun.sh) >= 1.4.4 (includes the CVE-2026-111497 Brotli security fix).
 
 ```sh
-bun add swerverts
+bun add swerver-ts
 ```
 
-swerverts needs the swerver engine: the binary for the socket backend,
+swerver-ts needs the swerver engine: the binary for the socket backend,
 `libswerver` for the FFI backend. It locates them in this order:
 
 1. an explicit `binaryPath` / `libraryPath` passed to `new Swerver({ ... })`
@@ -44,14 +44,14 @@ swerverts needs the swerver engine: the binary for the socket backend,
 3. a prebuilt `@swerver/<os>-<arch>` package, installed automatically as an
    optionalDependency for the host platform (esbuild/@swc style)
 
-A published prebuilt makes `bun add swerverts` runnable with no extra setup. For
+A published prebuilt makes `bun add swerver-ts` runnable with no extra setup. For
 local development against a source checkout, point `SWERVER_BIN` / `SWERVER_LIB`
 at the engine's `zig-out/bin` / `zig-out/lib`.
 
 ## Usage
 
 ```ts
-import { Swerver } from "swerverts";
+import { Swerver } from "swerver-ts";
 
 const app = new Swerver({
   port: 8080,
@@ -71,7 +71,7 @@ await app.start();
 
 ### Responses and errors
 
-A handler can return a value and swerverts builds the response: objects and
+A handler can return a value and swerver-ts builds the response: objects and
 arrays become JSON, strings become `text/plain`, `undefined` is `204`, and a
 `Response` (or `ctx.json(...)` / `ctx.text(...)`) is used as-is when you need to
 set a status or headers. When a route declares a `response` schema, the returned
@@ -81,7 +81,7 @@ For a controlled error status, throw or return an `HttpError` via `error()`. Its
 body is JSON for objects and text for strings, and it skips the error handler.
 
 ```ts
-import { Swerver, error } from "swerverts";
+import { Swerver, error } from "swerver-ts";
 
 const app = new Swerver().get("/users/:id", (_req, { params }) => {
   const user = db.get(params.id);
@@ -380,7 +380,7 @@ after the dot) put the FFI backend ahead of Express and Fastify in each shown
 scenario. These are tuning snapshots, not portable guarantees; rerun on the
 target host and workload.
 
-| scenario | Express | Fastify | Bun | swerverts FFI |
+| scenario | Express | Fastify | Bun | swerver-ts FFI |
 | --- | ---: | ---: | ---: | ---: |
 | pipeline | 70,976 · 67k/core | 86,004 · 83k/core | 231,352 · 229k/core | 101,535 · 85k/core |
 | baseline | 66,810 · 66k/core | 83,633 · 83k/core | 198,052 · 196k/core | 90,440 · 74k/core |

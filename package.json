@@ -1,6 +1,6 @@
 {
-  "name": "swerverts",
-  "version": "0.1.2",
+  "name": "swerver-ts",
+  "version": "0.1.3",
   "description": "Run the swerver gateway with TypeScript route handlers.",
   "type": "module",
   "module": "src/index.ts",
@@ -12,14 +12,23 @@
       "import": "./src/index.ts"
     }
   },
-  "files": ["src", "README.md"],
+  "files": [
+    "src",
+    "README.md"
+  ],
   "scripts": {
     "example": "bun run examples/hello.ts",
     "typecheck": "tsc --noEmit",
     "test": "bun test && tsc --noEmit",
     "test:ffi": "bun test test/ffi.test.ts"
   },
-  "keywords": ["swerver", "gateway", "http", "proxy", "bun"],
+  "keywords": [
+    "swerver",
+    "gateway",
+    "http",
+    "proxy",
+    "bun"
+  ],
   "license": "MIT",
   "engines": {
     "bun": ">=1.4.4"
@@ -33,5 +42,13 @@
     "@types/node": "^26.4.0",
     "typescript": "^7.0.2",
     "zod": "^4.4.3"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/justinGrosvenor/swerver-ts.git"
+  },
+  "homepage": "https://github.com/justinGrosvenor/swerver-ts#readme",
+  "bugs": {
+    "url": "https://github.com/justinGrosvenor/swerver-ts/issues"
   }
 }
